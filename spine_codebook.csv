@@ -1,0 +1,55 @@
+variable,description
+child_id,Unique child identifier (NHRC).
+motherid,Unique mother identifier.
+locationid,Compound identifier.
+gps_latitude,Household-level GPS latitude (decimal degrees).
+gps_longitude,Household-level GPS longitude (decimal degrees).
+location,"Rural/Urban indicator (1=rural, 2=urban)."
+sdate,Start date of the maternal residency episode that the surviving row represents.
+edate,End date of the maternal residency episode that the surviving row represents.
+seventtype,"Event type at residency start (1=birth, 2=enter, 3=enumeration; NHRC codebook)."
+eeventtype,"Event type at residency end (1=death, 2=exited, 3=present; NHRC codebook)."
+child_dob,Date of birth (delivery).
+child_dod,Date of death; NA if alive at last record.
+age_death_days,Integer days from child_dob to child_dod; NA if alive.
+died_day0,1 if death on day of birth.
+died_enn,1 if death within 0–7 days of birth (early neonatal).
+died_neonatal,1 if death within 0–28 days (neonatal).
+died_infant,1 if death within 0–365 days (infant).
+died_u5,"1 if death within 0–1,826 days (under-five)."
+stillbirth,1 if child_birth_type = 4 (stillbirth as recorded).
+perinatal,Stream A primary outcome: 1 if stillbirth OR died_enn.
+child_gender,"Sex of child (1=male, 2=female; codebook applies)."
+child_bwgt,"Birth weight in kg; 0, 9.9, and outliers set to NA."
+lbw,1 if birth weight < 2.5 kg; NA if weight missing.
+vlbw,1 if birth weight < 1.5 kg; NA if weight missing.
+child_birth_place,"Place of birth (1=hospital, 2=health centre, 3=home, 4=tba home, 5=other; NHRC codebook)."
+delivery_type,"Mode of delivery (1=normal vaginal, 2=cesarean, 3=vacuum, 4=forceps, 5=vaginal cutting, 7=other; NHRC codebook)."
+assist_del,"Delivery assistance (1=doctor, 2=midwife, 3=nurse, 4=CHO, 5=TBA, 6=family, 7=other; NHRC codebook)."
+cutcod,"Material used to cut umbilical cord (1=new razor, 2=old razor, 3=knife, 4=sharp stone, 5=scissors, 6=other; NHRC codebook)."
+corddress,"Material used to dress umbilical stump (1=shea butter, 2=black powder + shea, 3=western medicine, 4=nothing, 5=other; NHRC codebook)."
+ancatt,"ANC attendance (1=yes, 2=no); reliable only 2013+."
+prgmonth,Pregnancy month at first ANC visit; reliable only 2013+.
+numanc,Number of ANC visits during pregnancy; reliable only 2013+.
+first_nb,1 if first live birth of mother; 2 otherwise.
+ceb,Children ever born.
+parity_cat,Parity categories from ceb; NA where ceb missing.
+nulliparous_proxy,1 if first_nb==1 (use when ceb missing).
+mother_dob,Mother date of birth.
+mat_age_yrs,Maternal age at delivery (years).
+mat_age_cat,"Maternal-age categories: <20, 20-24, 25-29, 30-34, 35+."
+mother_educ,"Maternal education (0=none, 1=primary, 2=JHS, 3=SHS, 4=tertiary; NHRC codebook)."
+educ_any_secondary,1 if mother_educ >= 2 (JHS or higher).
+mother_mstatus,"Marital status (1=divorced, 2=died, 3=married, 4=separated, 5=single, 6=widowed; NHRC codebook)."
+ses_index,SES quintile (1=poorest – 5=least poor; NHRC codebook).
+birth_year,Calendar year of birth.
+birth_month,Calendar month of birth.
+season3,Season of delivery (dry_cool / hot_dry / wet).
+season2,Season of delivery (dry / wet).
+preg_start_assumed,Assumed pregnancy start (child_dob - 280 days).
+preg_t3_start,Start of third trimester (child_dob - 98 days).
+preg_last30,30 days before delivery.
+preg_last7,7 days before delivery.
+anc_reliable,1 if birth in 2013 onward (ANC-reliable sub-cohort).
+child_birth_type,"Raw integer outcome code (1=abortion, 2=miscarriage, 3=live birth, 4=stillbirth, 5=neonatal death, 6=censored preg, 7=still preg; 8/9 recoded NA per NHRC codebook)."
+outcome_class,Labelled child_birth_type (abortion / miscarriage / live_birth / stillbirth / neonatal_death_at_record / censored_pregnancy / ongoing_pregnancy).

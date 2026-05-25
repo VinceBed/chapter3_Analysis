@@ -1,15 +1,9 @@
 ---
 title: "Building the Analytic Spine — Navrongo HDSS Extract"
 subtitle: "Heat Stress and Perinatal Outcomes in Ghana"
-author: "Vincent"
+author: "Vincent Bio Bediako"
 date: "`r format(Sys.Date(), '%d %B %Y')`"
 output:
-  pdf_document:
-    toc: yes
-    toc_depth: 3
-    number_sections: yes
-    keep_tex: no
-    latex_engine: xelatex
   html_document:
     toc: yes
     toc_depth: 3
@@ -22,6 +16,12 @@ output:
     theme: flatly
     highlight: tango
     fig_caption: yes
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+    number_sections: yes
+    keep_tex: no
+    latex_engine: xelatex
   github_document:
     toc: yes
     toc_depth: 3
@@ -59,20 +59,28 @@ The three operations executed here are:
   row per unique child, and the maternal residency episodes are retained in a
   separate long-format table that downstream survival or migration-history
   models can join back to.
-- **(iii) Recoding of HDSS missing-data sentinels.** Two integer sentinels are
-  in use across the HDSS extract — `88` and `99` — per the data-management
-  conventions confirmed by NHRC. Both are recoded to `NA` for `ceb`,
-  `prgmonth`, and `numanc`. The value `0` in `child_bwgt` is treated as
-  "not weighed" rather than as a real observation. Biologically implausible
-  birth weights (>6 kg or <0.5 kg) are also set to `NA`, as are blank cells
-  in `mother_mstatus`.
+- **(iii) Recoding of HDSS missing-data sentinels.** Per the NHRC value-label
+  codebook (delivered 20 May 2026), the integers `8` and `9` denote
+  "NaN/missing" and "DK" in the categorical fields. The codebook conventions
+  are applied here. In addition, earlier correspondence flagged `88` and `99`
+  as missing in `ceb`, `prgmonth`, and `numanc`; these are also recoded
+  defensively, though neither appears in the present sample. The value `0`
+  in `child_bwgt` denotes a child who was not weighed; biologically
+  implausible weights (>6 kg or <0.5 kg) and the residual code `9.9` are
+  also set to `NA`. Blank cells in `mother_mstatus` are recoded to `NA`.
 - **(iv) Construction of derived analytic variables.** Mortality indicators
-  (day-0, early-neonatal, neonatal, infant, under-five), birth-weight
-  categories (LBW, VLBW), maternal-age and parity categories, season of
-  delivery on both the three-season and two-season conventions for northern
-  Ghana, reconstructed pregnancy windows for downstream DLNM linkage, and a
-  flag for the **post-2012 ANC-reliable sub-cohort** used in the
-  care-modifier sub-analyses.
+  (stillbirth-as-recorded, day-0, early-neonatal, neonatal, infant,
+  under-five), birth-weight categories (LBW, VLBW), maternal-age and parity
+  categories, season of delivery on both the three-season and two-season
+  conventions for northern Ghana, reconstructed pregnancy windows for
+  downstream DLNM linkage, and a flag for the **post-2012 ANC-reliable
+  sub-cohort** used in the care-modifier sub-analyses.
+
+**Variable name reconciliation.** The 20 May 2026 sample uses three field
+names that differ from the 30 April 2026 sample: `cordres1` → `corddress`,
+`delivery` → `delivery_type`, `gender` → `child_gender`. The script uses
+the new names throughout; if it is re-run against the older extract these
+will need to be renamed back.
 
 **Analytic window.** Following the workflow agreed with NHRC, the primary
 analytic window covers *all available birth-outcome records* in the full
@@ -84,10 +92,16 @@ variables (`numanc`, `prgmonth`, `ancatt`) are reliably populated only from
 restricted to a 2013-onward sub-cohort, with a binary flag (`anc_reliable`)
 constructed in the spine for that purpose.
 
+**Geocodes.** Household-level coordinates (`gps_latitude`, `gps_longitude`)
+are present in this sample. Coverage is partial in the sample (concentrated
+in more recent years); the full extract is expected to have broader
+coverage. The spine preserves the coordinates as-is for downstream linkage
+in `02_link_era5_utci.Rmd`.
+
 The numeric category codes for `assist_del`, `child_birth_place`,
-`delivery`, `cutcod`, `cordres1`, `seventtype`, and `eeventtype` are kept as
-integers pending the NHRC value-label codebook, which will be applied in a
-follow-up labelling chunk once received from the Centre.
+`delivery_type`, `cutcod`, `corddress`, `seventtype`, and `eeventtype`
+will be converted to labelled factors in a follow-up labelling chunk
+using the NHRC codebook delivered on 20 May 2026.
 
 # Setup
 
@@ -105,7 +119,7 @@ library(knitr)
 library(kableExtra)
 
 # Adjust these paths to match the project layout.
-IN_PATH <- "vincent_phd_data_30042026.dta"
+IN_PATH <- "vincent_phd_10data_20052026.dta"
 OUT_DIR <- "."
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 ```
@@ -114,10 +128,26 @@ A small helper used throughout the document to render diagnostic tables in a
 consistent style:
 
 ```{r helper}
-nice_table <- function(x, caption = NULL, full_width = FALSE) {
-  kable(x, caption = caption, format.args = list(big.mark = ",")) |>
-    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
-                  full_width = full_width, position = "left")
+nice_table <- function(x, caption = NULL, full_width = FALSE,
+                       wrap_col = NULL, wrap_width = "10cm") {
+  # Detect output format (HTML vs LaTeX) so the styling adapts.
+  fmt <- knitr::is_html_output()
+  k <- kable(x, caption = caption, format.args = list(big.mark = ","),
+             booktabs = TRUE, longtable = TRUE)
+  if (fmt) {
+    k <- kable_styling(k,
+                       bootstrap_options = c("striped", "hover", "condensed"),
+                       full_width = full_width, position = "left")
+  } else {
+    k <- kable_styling(k,
+                       latex_options = c("striped", "hold_position", "repeat_header"),
+                       full_width = full_width, position = "left")
+  }
+  # For tables with a wide description column, wrap that column at fixed width.
+  if (!is.null(wrap_col)) {
+    k <- column_spec(k, wrap_col, width = wrap_width)
+  }
+  k
 }
 ```
 
@@ -141,27 +171,37 @@ tibble(metric = c("rows", "columns",
   nice_table(caption = "Raw extract — basic dimensions")
 ```
 
-The difference between rows (15,639) and unique children (14,406) reflects
-the residency-episode duplication that step (ii) will resolve.
+The difference between raw rows and unique children reflects the
+residency-episode duplication that step (ii) will resolve.
 
 # Step (iii): Recode HDSS missing-data sentinels
 
-Per the NHRC data-management conventions, the integers `88` and `99` are
-both used as missing-data sentinels in the parity (`ceb`) and antenatal-care
-(`prgmonth`, `numanc`) fields. The value `0` in `child_bwgt` denotes a child
-who was not weighed rather than a child who weighed zero kilograms. A small
-number of birth weights also fall outside biologically plausible bounds and
-are treated as missing.
+Per the NHRC value-label codebook of 20 May 2026, the integers `8` (NaN) and
+`9` (DK) denote missing values across the categorical fields. The values `88`
+and `99` were flagged in earlier correspondence as missing in `ceb`,
+`prgmonth`, and `numanc` and are recoded defensively, though neither appears
+in the present sample. The value `0` in `child_bwgt` denotes a child who was
+not weighed; biologically implausible weights and the residual code `9.9`
+are also set to `NA`.
 
 ```{r recode}
+sentinel_cat <- c(8, 9)
+sentinel_num <- c(88, 99)
+
 df <- raw |>
   mutate(
-    ceb            = if_else(ceb      %in% c(88, 99), NA_real_, ceb),
-    prgmonth       = if_else(prgmonth %in% c(88, 99), NA_real_, prgmonth),
-    numanc         = if_else(numanc   %in% c(88, 99), NA_real_, numanc),
-    child_bwgt     = if_else(child_bwgt == 0 | child_bwgt < 0.5 |
+    ceb            = if_else(ceb %in% sentinel_num, NA_real_, ceb),
+    prgmonth       = if_else(prgmonth %in% sentinel_num, NA_real_, prgmonth),
+    numanc         = if_else(numanc %in% sentinel_num, NA_real_, numanc),
+    across(c(assist_del, child_birth_place, delivery_type, cutcod,
+             corddress, ancatt, first_nb, child_birth_type),
+           ~ if_else(.x %in% sentinel_cat, NA_real_, .x)),
+    child_bwgt     = if_else(child_bwgt == 0 |
+                               child_bwgt == 9.9 |
+                               child_bwgt < 0.5 |
                                child_bwgt > 6.0,
                              NA_real_, child_bwgt),
+    mother_mstatus = as.character(mother_mstatus),
     mother_mstatus = if_else(str_trim(mother_mstatus) == "",
                              NA_character_, mother_mstatus)
   )
@@ -170,18 +210,27 @@ df <- raw |>
 Effect of the recode on the non-missing counts of the affected fields:
 
 ```{r recode-summary}
+before_vals <- c(
+  ceb = sum(!is.na(raw$ceb)),
+  prgmonth = sum(!is.na(raw$prgmonth)),
+  numanc = sum(!is.na(raw$numanc)),
+  child_bwgt = sum(!is.na(raw$child_bwgt)),
+  mother_mstatus = sum(!is.na(as.character(raw$mother_mstatus)) &
+                         trimws(as.character(raw$mother_mstatus)) != "")
+)
+
+after_vals <- c(
+  ceb = sum(!is.na(df$ceb)),
+  prgmonth = sum(!is.na(df$prgmonth)),
+  numanc = sum(!is.na(df$numanc)),
+  child_bwgt = sum(!is.na(df$child_bwgt)),
+  mother_mstatus = sum(!is.na(df$mother_mstatus))
+)
+
 tibble(
-  variable     = c("ceb", "prgmonth", "numanc", "child_bwgt", "mother_mstatus"),
-  before_n     = c(sum(!is.na(raw$ceb)),
-                   sum(!is.na(raw$prgmonth)),
-                   sum(!is.na(raw$numanc)),
-                   sum(!is.na(raw$child_bwgt)),
-                   sum(raw$mother_mstatus != "" & !is.na(raw$mother_mstatus))),
-  after_n      = c(sum(!is.na(df$ceb)),
-                   sum(!is.na(df$prgmonth)),
-                   sum(!is.na(df$numanc)),
-                   sum(!is.na(df$child_bwgt)),
-                   sum(!is.na(df$mother_mstatus))),
+  variable = names(before_vals),
+  before_n = as.integer(before_vals),
+  after_n = as.integer(after_vals),
   n_recoded_NA = before_n - after_n
 ) |>
   nice_table(caption = "Non-missing counts before and after sentinel recoding")
@@ -218,24 +267,40 @@ head(residency_episodes, 6) |>
 
 # Step (ii.b): Deduplicate to one row per child
 
-Where multiple rows share a `child_id`, the surviving row is chosen by two
-ordered criteria:
-
-1. Lowest count of missing values across the analytic covariate set.
-2. Tie-break on the most recent `sdate` (the latest residency context is
-   closest in time to the heat-exposure window of interest).
+Where multiple rows share a `child_id`, the surviving row is chosen by three
+ordered criteria. The first is **outcome preservation**: rows with a definite
+birth outcome (`child_birth_type` = 1–5, covering abortion, miscarriage, live
+birth, stillbirth, and neonatal death) take precedence over the
+pregnancy-still-in-progress codes (6 = censored preg, 7 = still preg) and
+over missing/DK codes. This avoids the failure mode in which stillbirths
+and very-early neonatal deaths recorded at the time of the pregnancy event
+are overwritten by later residency-only rows that carry a "censored
+pregnancy" code. The second is lowest count of missing values across the
+analytic covariate set. The third is tie-break on the most recent `sdate`.
 
 ```{r dedup}
 analytic_vars <- c("mother_educ", "ses_index", "mother_mstatus",
-                   "child_bwgt", "child_birth_place", "delivery",
+                   "child_bwgt", "child_birth_place", "delivery_type",
                    "ancatt", "prgmonth", "numanc",
-                   "first_nb", "assist_del", "cutcod", "cordres1")
+                   "first_nb", "assist_del", "cutcod", "corddress")
+
+# Priority for outcome codes: definite outcomes (1-5) win over pregnancy
+# in progress (6,7) which win over missing (NA).
+outcome_priority <- function(x) {
+  case_when(
+    x %in% c(1, 2, 3, 4, 5) ~ 1L,   # abortion, miscarriage, live birth, SB, ND
+    x == 6                  ~ 2L,   # censored preg
+    x == 7                  ~ 3L,   # still preg
+    TRUE                    ~ 9L    # missing/DK
+  )
+}
 
 spine_pre <- df |>
-  mutate(.miss_score = rowSums(is.na(across(all_of(analytic_vars))))) |>
-  arrange(child_id, .miss_score, desc(sdate)) |>
+  mutate(.outcome_priority = outcome_priority(child_birth_type),
+         .miss_score       = rowSums(is.na(across(all_of(analytic_vars))))) |>
+  arrange(child_id, .outcome_priority, .miss_score, desc(sdate)) |>
   distinct(child_id, .keep_all = TRUE) |>
-  dplyr::select(-.miss_score)
+  dplyr::select(-.outcome_priority, -.miss_score)
 
 stopifnot(!anyDuplicated(spine_pre$child_id))
 
@@ -248,6 +313,29 @@ tibble(metric = c("rows in spine (= unique children)",
   nice_table(caption = "Effect of child-level deduplication")
 ```
 
+**Interpreting the dedup count.** The rows removed by deduplication are not
+"lost" data: they are redundant *maternal-context copies* of children who
+appear on more than one residency row in the raw extract. Because the HDSS
+data model is mother-centric (each row is a maternal residency episode,
+not a child), a single child travels alongside the mother across each of
+her recorded residency episodes, producing one row per (child, maternal
+residency) pair. The dedup collapses these to one row per child for
+modelling purposes, while the full residency-episode history is preserved
+separately in `residency_episodes.rds` and can be joined back to the spine
+on `motherid` for analyses that require maternal-migration context. No
+child is dropped: the post-dedup row count equals the number of distinct
+`child_id` values in the raw extract.
+
+**A note on temporal snapshots in the spine.** Because the dedup tie-break
+selects the most recent `sdate` among rows tied on outcome priority and
+missingness, maternal characteristics that vary over time (`ses_index`,
+`mother_educ`, `mother_mstatus`, residential `location`) in the spine
+reflect the latest available maternal record rather than the value at the
+time of the child's birth. For most fields this matters little — maternal
+education and SES typically change slowly — but it is worth flagging in
+the analytic write-up as a documented analytic choice, and may be a topic
+for discussion with NHRC on whether a different convention is preferred.
+
 # Step (iv): Derived analytic variables
 
 Several conventions used in this block deserve explicit mention.
@@ -257,14 +345,15 @@ Several conventions used in this block deserve explicit mention.
   and as `0` (not `NA`) for the binary mortality indicators, so that those
   indicators are NA-safe for downstream regression.
 - The 280-day term-gestation assumption used to back-date pregnancy start is
-  a working default. Sensitivity analyses should also fit results at 259 and
+  a working default. Sensitivity analyses would also fit results at 259 and
   294 days to bracket gestational-age error.
 - Northern Ghana climatology follows the conventional three-season split:
   *dry-cool* (Nov–Mar), *hot-dry* (Apr–May), and *wet* (Jun–Oct). A
   two-level wet-vs-dry version is also retained for parsimonious models.
 - Parity is taken from `ceb` where available. Because `ceb` is missing for
-  approximately 52% of records, a binary nulliparous proxy is also computed
-  from the fully-populated `first_nb` field.
+  a substantial fraction of records (approximately 45% in the 20 May 2026
+  sample), a binary nulliparous proxy is also computed from the
+  fully-populated `first_nb` field.
 
 ```{r derive}
 spine <- spine_pre |>
@@ -289,6 +378,13 @@ spine <- spine_pre |>
                             & age_death_days <= 365,                              1L, 0L),
     died_u5       = if_else(!is.na(age_death_days) & age_death_days >= 0
                             & age_death_days <= 1826,                             1L, 0L),
+
+    # ---- Stream A primary outcome: stillbirth + ENN composite ----
+    # Stillbirth as recorded in child_birth_type (code = 4)
+    stillbirth = if_else(!is.na(child_birth_type) & child_birth_type == 4, 1L, 0L),
+    # Perinatal mortality (Stream A primary): stillbirth OR death within
+    # the first 7 days of life
+    perinatal  = if_else(stillbirth == 1 | died_enn == 1, 1L, 0L),
 
     # ---- Birth-weight derivatives ----
     lbw  = if_else(!is.na(child_bwgt), as.integer(child_bwgt <  2.5), NA_integer_),
@@ -367,7 +463,7 @@ spine |>
     died_u5       = "Under-five death (0–1,826 days)"
   )) |>
   dplyr::select(indicator, definition, events) |>
-  nice_table(caption = "Mortality event counts, full file (1984–2023)")
+  nice_table(caption = "Mortality event counts, full sample (1995–2020)")
 ```
 
 ## ANC-reliable sub-cohort (2013 onward)
@@ -429,6 +525,83 @@ spine |>
   nice_table(caption = "Maternal age category, full file")
 ```
 
+## Missing-data audit
+
+The audit below reports, for every variable that enters the analytic plan,
+the non-missing count in the spine, the overall percent missing, and the
+percent missing within the pre-2013 and 2013-onward sub-cohorts. The audit
+serves three purposes. First, it produces a single transparent record of
+what is and is not measured. Second, the era-stratified columns expose
+which variables are *structurally* missing (because the field was not
+collected before a given year) versus those that are *operationally*
+missing within an era (and therefore require analytic handling).
+Third, the audit gives the analyst and the Centre a shared reference
+point for any conversation about missing-data handling for the full
+extract.
+
+A note on apparent vs latent missingness. The ANC fields `prgmonth` and
+`numanc` appear in the audit as essentially complete (≈100% non-missing),
+but in the pre-2013 period the recorded values are typically `0` (a
+placeholder for "not recorded") rather than `NA`. This is a *latent*
+missingness pattern that the audit does not detect on its own; it is
+addressed analytically by restricting all ANC-conditioned models to the
+2013-onward sub-cohort using the `anc_reliable` flag, where the recorded
+values reflect genuine ANC visit counts and pregnancy months at first
+visit.
+
+```{r missingness-audit}
+audit_vars <- tribble(
+  ~variable,            ~label,
+  "gps_latitude",       "GPS latitude (household)",
+  "gps_longitude",      "GPS longitude (household)",
+  "mother_educ",        "Maternal education",
+  "mother_mstatus",     "Maternal marital status",
+  "ses_index",          "SES quintile",
+  "child_bwgt",         "Birth weight (kg)",
+  "ceb",                "Children ever born",
+  "first_nb",           "First live birth indicator",
+  "prgmonth",           "Pregnancy month at first ANC (see latent note)",
+  "numanc",             "Number of ANC visits (see latent note)",
+  "ancatt",             "ANC attendance",
+  "child_birth_place",  "Place of delivery",
+  "delivery_type",      "Mode of delivery",
+  "assist_del",         "Birth attendance",
+  "cutcod",             "Umbilical cord cutting",
+  "corddress",          "Umbilical cord dressing"
+)
+
+audit <- audit_vars |>
+  rowwise() |>
+  mutate(
+    n_nonmiss = sum(!is.na(spine[[variable]])),
+    pct_miss  = round(mean(is.na(spine[[variable]])) * 100, 1),
+    pct_miss_pre  = round(mean(is.na(spine[[variable]][spine$anc_reliable == 0])) * 100, 1),
+    pct_miss_post = round(mean(is.na(spine[[variable]][spine$anc_reliable == 1])) * 100, 1)
+  ) |>
+  ungroup() |>
+  dplyr::select(variable, label, n_nonmiss, pct_miss, pct_miss_pre, pct_miss_post)
+
+audit |>
+  nice_table(caption = "Missingness audit — non-missing counts and percent missing overall and by ANC-reliable era",
+             wrap_col = 2, wrap_width = "7cm")
+```
+
+**Reading the audit.** The audit reveals four distinct missingness patterns
+that drive the analytic handling decisions documented in Chapter 3
+(§3.10.8). First, a set of variables (`mother_mstatus`, `mother_educ`,
+maternal age, infant sex, place of delivery, delivery type, birth
+attendance, cord-care fields) are essentially complete (<1% missing) and
+require no special handling. Second, `child_bwgt` shows a strong era
+gradient: about 81% missing before 2013 and about 30% missing thereafter,
+reflecting the rise in facility deliveries and routine weighing over the
+analytic window. Third, `gps_latitude` and `gps_longitude` are missing for
+about 70% of records overall, with only a modest era gradient (72% vs
+64%), indicating that the geocoding programme has not been retroactively
+applied uniformly to the historical record. Fourth, `ceb` is missing for
+about 39% of records across both eras, consistent with
+respondent-conditioned missingness that affects parity reporting throughout
+the surveillance period.
+
 # Spine codebook
 
 The variable list below documents the derived analytic spine. It is also
@@ -439,39 +612,47 @@ spine_codebook <- tribble(
   ~variable,             ~description,
   "child_id",            "Unique child identifier (NHRC).",
   "motherid",            "Unique mother identifier.",
-  "locationid",          "Compound identifier (8,472 unique in this extract).",
-  "location",            "Rural/Urban indicator (R/U).",
+  "locationid",          "Compound identifier.",
+  "gps_latitude",        "Household-level GPS latitude (decimal degrees).",
+  "gps_longitude",       "Household-level GPS longitude (decimal degrees).",
+  "location",            "Rural/Urban indicator (1=rural, 2=urban).",
+  "sdate",               "Start date of the maternal residency episode that the surviving row represents.",
+  "edate",               "End date of the maternal residency episode that the surviving row represents.",
+  "seventtype",          "Event type at residency start (1=birth, 2=enter, 3=enumeration; NHRC codebook).",
+  "eeventtype",          "Event type at residency end (1=death, 2=exited, 3=present; NHRC codebook).",
   "child_dob",           "Date of birth (delivery).",
   "child_dod",           "Date of death; NA if alive at last record.",
   "age_death_days",      "Integer days from child_dob to child_dod; NA if alive.",
-  "died_day0",           "1 if death on day of birth (perinatal proxy).",
+  "died_day0",           "1 if death on day of birth.",
   "died_enn",            "1 if death within 0–7 days of birth (early neonatal).",
   "died_neonatal",       "1 if death within 0–28 days (neonatal).",
   "died_infant",         "1 if death within 0–365 days (infant).",
   "died_u5",             "1 if death within 0–1,826 days (under-five).",
-  "gender",              "Sex of child (F/M).",
-  "child_bwgt",          "Birth weight in kg; 0-coded values and outliers set NA.",
+  "stillbirth",          "1 if child_birth_type = 4 (stillbirth as recorded).",
+  "perinatal",           "Stream A primary outcome: 1 if stillbirth OR died_enn.",
+  "child_gender",        "Sex of child (1=male, 2=female; codebook applies).",
+  "child_bwgt",          "Birth weight in kg; 0, 9.9, and outliers set to NA.",
   "lbw",                 "1 if birth weight < 2.5 kg; NA if weight missing.",
   "vlbw",                "1 if birth weight < 1.5 kg; NA if weight missing.",
-  "child_birth_place",   "Place of birth (1–4 codes; codebook needed).",
-  "delivery",            "Mode of delivery (1–5 codes; codebook needed).",
-  "assist_del",          "Delivery-assistance code (1–6; codebook needed).",
-  "cutcod",              "Material used to cut umbilical cord.",
-  "cordres1",            "Material used to dress umbilical stump.",
+  "child_birth_place",   "Place of birth (1=hospital, 2=health centre, 3=home, 4=tba home, 5=other; NHRC codebook).",
+  "delivery_type",       "Mode of delivery (1=normal vaginal, 2=cesarean, 3=vacuum, 4=forceps, 5=vaginal cutting, 7=other; NHRC codebook).",
+  "assist_del",          "Delivery assistance (1=doctor, 2=midwife, 3=nurse, 4=CHO, 5=TBA, 6=family, 7=other; NHRC codebook).",
+  "cutcod",              "Material used to cut umbilical cord (1=new razor, 2=old razor, 3=knife, 4=sharp stone, 5=scissors, 6=other; NHRC codebook).",
+  "corddress",           "Material used to dress umbilical stump (1=shea butter, 2=black powder + shea, 3=western medicine, 4=nothing, 5=other; NHRC codebook).",
   "ancatt",              "ANC attendance (1=yes, 2=no); reliable only 2013+.",
   "prgmonth",            "Pregnancy month at first ANC visit; reliable only 2013+.",
   "numanc",              "Number of ANC visits during pregnancy; reliable only 2013+.",
   "first_nb",            "1 if first live birth of mother; 2 otherwise.",
-  "ceb",                 "Children ever born; 88 and 99 are HDSS missing sentinels (recoded NA).",
+  "ceb",                 "Children ever born.",
   "parity_cat",          "Parity categories from ceb; NA where ceb missing.",
   "nulliparous_proxy",   "1 if first_nb==1 (use when ceb missing).",
   "mother_dob",          "Mother date of birth.",
   "mat_age_yrs",         "Maternal age at delivery (years).",
   "mat_age_cat",         "Maternal-age categories: <20, 20-24, 25-29, 30-34, 35+.",
-  "mother_educ",         "Maternal education (0=none,1=primary,2=JHS,3=SHS,4=tertiary).",
+  "mother_educ",         "Maternal education (0=none, 1=primary, 2=JHS, 3=SHS, 4=tertiary; NHRC codebook).",
   "educ_any_secondary",  "1 if mother_educ >= 2 (JHS or higher).",
-  "mother_mstatus",      "Marital status (MAR, DIV, WID, DTH; blanks recoded NA).",
-  "ses_index",           "SES quintile (1=poorest – 5=least poor).",
+  "mother_mstatus",      "Marital status (1=divorced, 2=died, 3=married, 4=separated, 5=single, 6=widowed; NHRC codebook).",
+  "ses_index",           "SES quintile (1=poorest – 5=least poor; NHRC codebook).",
   "birth_year",          "Calendar year of birth.",
   "birth_month",         "Calendar month of birth.",
   "season3",             "Season of delivery (dry_cool / hot_dry / wet).",
@@ -481,10 +662,12 @@ spine_codebook <- tribble(
   "preg_last30",         "30 days before delivery.",
   "preg_last7",          "7 days before delivery.",
   "anc_reliable",        "1 if birth in 2013 onward (ANC-reliable sub-cohort).",
-  "outcome_class",       "Labelled child_birth_type."
+  "child_birth_type",    "Raw integer outcome code (1=abortion, 2=miscarriage, 3=live birth, 4=stillbirth, 5=neonatal death, 6=censored preg, 7=still preg; 8/9 recoded NA per NHRC codebook).",
+  "outcome_class",       "Labelled child_birth_type (abortion / miscarriage / live_birth / stillbirth / neonatal_death_at_record / censored_pregnancy / ongoing_pregnancy)."
 )
 
-nice_table(spine_codebook, caption = "Spine codebook")
+nice_table(spine_codebook, caption = "Spine codebook",
+           wrap_col = 2, wrap_width = "11cm")
 ```
 
 # Persist outputs
@@ -507,39 +690,43 @@ cat("Files written to ", normalizePath(OUT_DIR), ":\n  ",
           collapse = "\n  "), sep = "")
 ```
 
-# Expected diagnostic counts (sample dataset)
+# Expected diagnostic counts (sample dataset, 20 May 2026)
 
-The script has been validated against the sample extract delivered on 30
-April 2026. A successful run on that sample should reproduce the following
-counts; any discrepancy indicates that something has changed in the input
-file and should be investigated before downstream modelling proceeds. The
-full-data run, performed by the Centre's analysts under the agreed
-workflow, will produce different (larger) figures and an extended
-birth-year range; the expected-counts table is preserved as a sample-stage
-validation reference, not as a target for the full data.
+The script has been validated against the second sample extract delivered
+on 20 May 2026 (22,340 rows out of approximately 223,440 in the full
+extract, covering birth outcomes and maternal residency from 1995 to 2020).
+A successful run on that sample should reproduce the following counts; any
+discrepancy indicates that something has changed in the input file and
+should be investigated before downstream modelling proceeds. The full-data
+run, performed by the Centre's analysts under the agreed workflow, will
+produce substantially larger figures; the expected-counts table is
+preserved as a sample-stage validation reference, not as a target for the
+full data.
 
 ```{r expected, echo=FALSE}
 tibble(
   metric = c("rows in raw extract",
-             "unique children",
+             "unique children (spine)",
              "unique mothers",
-             "unique compounds",
+             "unique compounds (locationid)",
+             "distinct household GPS coordinates",
+             "records with non-missing GPS",
              "birth-year range (sample)",
-             "day-0 deaths (full file)",
-             "early-neonatal deaths (full file)",
-             "neonatal deaths (full file)",
-             "infant deaths (full file)",
-             "under-five deaths (full file)",
-             "n children in ANC-reliable sub-cohort",
-             "early-neonatal deaths, sub-cohort",
-             "neonatal deaths, sub-cohort",
-             "valid birth weights, sub-cohort",
-             "LBW (<2.5 kg), sub-cohort"),
-  expected_value = c("15,639", "14,406", "13,284", "8,472", "1984–2023",
-                     "67", "166", "258", "636", "1,027",
-                     "5,560", "32", "41", "3,190", "387")
+             "recorded stillbirths (child_birth_type = 4)",
+             "early-neonatal deaths (0–7 days, full file)",
+             "neonatal deaths (0–28 days, full file)",
+             "perinatal mortality composite (SB + ENN)",
+             "n children in ANC-reliable sub-cohort (2013+)",
+             "valid birth weights (0.5–6.0 kg)",
+             "LBW (<2.5 kg)"),
+  expected_value = c("22,340", "8,876", "5,025", "2,885",
+                     "904", "2,696 (~30%)",
+                     "1995–2020",
+                     "1", "122", "173", "123",
+                     "2,942", "3,204", "347")
 ) |>
-  nice_table(caption = "Expected diagnostic counts for the SAMPLE dataset. Full-data figures will differ.")
+  nice_table(caption = "Expected diagnostic counts for the 20 MAY 2026 SAMPLE. Full-data figures will differ.",
+             wrap_col = 1, wrap_width = "10cm")
 ```
 
 # Session information
@@ -552,24 +739,25 @@ sessionInfo()
 
 With the spine in hand, the immediate items are, in order:
 
-1. **Apply the NHRC value-label codebook** for `assist_del`, `child_birth_place`,
-   `delivery`, `cutcod`, `cordres1`, `seventtype`, and `eeventtype` once it is
-   received from the Centre, and add a labelling chunk to this document that
-   promotes these integer fields to labelled factors. NHRC has confirmed
-   labels will be supplied where applicable.
+1. **Apply the NHRC value-label codebook** (received 20 May 2026) for
+   `assist_del`, `child_birth_place`, `delivery_type`, `cutcod`,
+   `corddress`, `mother_mstatus`, `child_gender`, `location`, `ses_index`,
+   `mother_educ`, `child_birth_type`, `seventtype`, and `eeventtype`, and
+   add a labelling chunk to this document that promotes these integer
+   fields to labelled factors.
 2. Write `02_link_era5_utci.Rmd`, which (i) reads `spine.rds`,
-   (ii) consumes the household-level geocodes that NHRC will release with
-   the full extract, (iii) links each pregnancy to a daily UTCI series
-   from ERA5-Land at the household coordinate, and (iv) writes the
+   (ii) consumes the household-level GPS coordinates that are already in
+   the spine, (iii) links each pregnancy to a daily UTCI series from
+   ERA5-Land at the household coordinate, and (iv) writes the
    pregnancy-level exposure matrix to `exposure.rds`. Per the workflow
    agreed with NHRC, all climate-variable generation — ERA5-Land download,
-   UTCI computation following Di Napoli et al. (2018), and gestational-window
-   aggregation — is conducted within this script and executed by the
-   Centre's analysts against the full extract.
+   UTCI computation following Di Napoli et al. (2018), and
+   gestational-window aggregation — is conducted within this script and
+   executed by the Centre's analysts against the full extract.
 3. Write `03_phase1_descriptive.Rmd`, `04_phase2_misclassification.Rmd`,
    `05_phase3_dlnm_perinatal.Rmd`, `06_phase4_casecrossover.Rmd`,
    `07_phase5_dlnm_birthweight.Rmd`, `08_phase6_effect_modification.Rmd`,
-   and `09_phase7_sensitivity.Rmd`, in line with the Chapter 3 analytic plan.
-   The effect-modification and ANC-related analyses use the 2013-onward
-   `anc_reliable` sub-cohort; the primary perinatal-outcome models use the
-   full birth-year range available in the NHRC extract.
+   and `09_phase7_sensitivity.Rmd`, in line with the Chapter 3 analytic
+   plan. The effect-modification and ANC-related analyses use the
+   2013-onward `anc_reliable` sub-cohort; the primary perinatal-outcome
+   models use the full birth-year range available in the NHRC extract.
