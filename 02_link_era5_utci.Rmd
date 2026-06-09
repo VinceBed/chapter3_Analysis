@@ -20,6 +20,12 @@ knitr::opts_chunk$set(
   warning = FALSE,
   comment = "#>"
 )
+
+# Defaults so conditional chunk eval= never fails before the config chunk runs.
+ERA5_ACQUISITION <- "cds_download"
+UTCI_SOURCE      <- "compute_in_script_package"
+RUN_CDS_DOWNLOAD <- TRUE
+RUN_UTCI_COMPUTE <- TRUE
 ```
 
 # Purpose and scope
@@ -123,20 +129,21 @@ UTCI_SOURCE <- "compute_in_script_package"
 
 ERA5_ACQUISITION <- "cds_download"
 
+# Chunk flags consumed by knitr eval= options (updated here after paths/modes set).
+RUN_CDS_DOWNLOAD <- (ERA5_ACQUISITION == "cds_download")
+RUN_UTCI_COMPUTE <- (UTCI_SOURCE != "precomputed_daily")
+
 # ============================================================================
 # Copernicus CDS credentials (used only if ERA5_ACQUISITION == "cds_download")
 #
-# Before running this script on a new machine, configure a CDS Personal
-# Access Token (PAT) once per environment, for example:
-  library(ecmwfr)
-
-wf_set_key(
-  key  = "b8cda5a0-7a4d-4827-82b8-42257c851b96"
-)
+# Configure once per machine — never paste a token into this file or Git:
+#   • Set env var CDS_API_KEY (recommended), e.g. in .Renviron:
+#       CDS_API_KEY=your-personal-access-token
+#   • Or run interactively once per session:
+#       ecmwfr::wf_set_key(key = "your-personal-access-token")
 #
 # Obtain a PAT from https://cds.climate.copernicus.eu/profile after
-# accepting the ERA5-Land licence terms. Never paste the token into this
-# file or commit it to Git. [web:73][web:75][web:78][web:81]
+# accepting the ERA5-Land licence terms.
 # ============================================================================
 ```
 
@@ -333,7 +340,8 @@ cat(sprintf("Unique (location, day) pairs to extract: %s\n",
 cat(sprintf("Compression ratio: %.2fx\n",
             nrow(preg_days) / nrow(extract_grid)))
 
-# Save the extraction grid to disk for the climate-acquisition step.
+# Save the extraction grid to disk; the UTCI step reads this to limit
+# month-tiles, locations, and calendar days processed.
 saveRDS(extract_grid, file.path(LOG_DIR, "extract_grid.rds"))
 ```
 
@@ -348,7 +356,19 @@ downward solar radiation (`surface_solar_radiation_downwards`).
 
 ## Option 2a — Download via Copernicus CDS
 
-```{r cds-download, eval = (ERA5_ACQUISITION == "cds_download")}
+```{r cds-download, eval = RUN_CDS_DOWNLOAD}
+configure_cds <- function() {
+  load_if_needed("ecmwfr")
+  key <- Sys.getenv("CDS_API_KEY", unset = "")
+  if (nzchar(key)) {
+    ecmwfr::wf_set_key(key = key)
+  }
+}
+
+if (ERA5_ACQUISITION == "cds_download") {
+  configure_cds()
+}
+
 cds_request <- function(year, month) {
   first_day <- as.Date(sprintf("%04d-%02d-01", year, month))
   n_days    <- lubridate::days_in_month(first_day)
@@ -475,10 +495,11 @@ the hour-of-day, with substantial downstream bias in UTCI.
 
 ## Option 1A/1C — Compute from ERA5-Land inputs
 
-```{r compute-utci, eval = (UTCI_SOURCE != "precomputed_daily")}
-# For each (year, month) tile, read the four input variables, compute
-# hourly UTCI at each unique household coordinate, aggregate to daily
-# summaries, and write a daily UTCI raster to UTCI_DIR.
+```{r compute-utci, eval = RUN_UTCI_COMPUTE}
+# For each (year, month) tile needed by extract_grid, read ERA5-Land inputs,
+# compute hourly UTCI only at required household coordinates and calendar
+# days, aggregate to daily max (primary) and daily mean (sensitivity), and
+# write a consolidated table to UTCI_DIR.
 
 # ----------------------------------------------------------------------------
 # Helper: De-accumulate ERA5-Land hourly accumulated radiation.
@@ -539,21 +560,27 @@ parse_era5_times <- function(spat_rast) {
 # Read one ERA5-Land variable from a NetCDF, returning a matrix of
 # (locations × time) values with associated timestamps. Handles both the
 # short-name and long-name variable conventions that CDS may return.
+# Optional time_indices restricts extraction to a subset of hourly layers.
 # ----------------------------------------------------------------------------
-read_era5_variable <- function(nc_path, var_candidates, locations_pts) {
-  # Try each candidate name in turn; the first one that opens cleanly wins.
+read_era5_variable <- function(nc_path, var_candidates, locations_pts,
+                               time_indices = NULL) {
   for (vn in var_candidates) {
     sub_r <- tryCatch(
       terra::rast(nc_path, subds = vn),
       error = function(e) NULL
     )
     if (!is.null(sub_r)) {
+      times <- parse_era5_times(sub_r)
+      if (!is.null(time_indices)) {
+        sub_r <- sub_r[[time_indices]]
+        times <- times[time_indices]
+      }
       pts <- terra::vect(as.matrix(locations_pts[, c("lon", "lat")]),
                          crs = "EPSG:4326")
       ex  <- terra::extract(sub_r, pts)[, -1, drop = FALSE]
       return(list(
         values    = as.matrix(ex),
-        times     = parse_era5_times(sub_r),
+        times     = times,
         var_used  = vn
       ))
     }
@@ -563,50 +590,91 @@ read_era5_variable <- function(nc_path, var_candidates, locations_pts) {
 }
 
 # ----------------------------------------------------------------------------
-# Main: compute daily UTCI summaries for one ERA5-Land month-tile.
+# Resolve hourly layer indices for the calendar days required from a tile.
 # ----------------------------------------------------------------------------
-compute_daily_utci <- function(nc_path, locations_pts, daily_stat) {
+era5_time_indices <- function(nc_path, var_candidates, days_needed) {
+  days_needed <- as.Date(days_needed)
+  for (vn in var_candidates) {
+    sub_r <- tryCatch(
+      terra::rast(nc_path, subds = vn),
+      error = function(e) NULL
+    )
+    if (!is.null(sub_r)) {
+      hour_dates <- as.Date(parse_era5_times(sub_r))
+      idx <- which(hour_dates %in% days_needed)
+      return(idx)
+    }
+  }
+  stop(sprintf("Could not resolve time axis in %s", basename(nc_path)))
+}
 
-  # Read each variable explicitly by trying both short and long names.
-  # This is more robust than parsing names() of the combined SpatRaster,
-  # because the CDS layer-naming conventions have changed over time and
-  # vary between the legacy and CDS-Beta API responses.
+# ----------------------------------------------------------------------------
+# Vectorized UTCI via comf's Bröde polynomial.
+# comf::calcUTCI() accepts scalars only; utciApprox() is the same polynomial
+# and accepts vector inputs (required for location × hour matrices).
+# ----------------------------------------------------------------------------
+calc_utci_vec <- function(ta, tr, vel, rh) {
+  utci_approx <- getFromNamespace("utciApprox", "comf")
+  utci_approx(
+    ta  = pmin(pmax(ta, 0), 40),
+    tr  = pmin(pmax(tr, 0), 40),
+    vel = pmin(pmax(vel, 0), 10),
+    rh  = pmin(pmax(rh, 0), 100)
+  )
+}
+
+# ----------------------------------------------------------------------------
+# Main: compute daily UTCI summaries for one ERA5-Land month-tile.
+# Returns daily max (utci) and daily mean (utci_mean) from the same hourly
+# series. Restrict to days_needed and locations_pts for efficiency.
+# ----------------------------------------------------------------------------
+compute_daily_utci <- function(nc_path, locations_pts, days_needed = NULL) {
+  if (nrow(locations_pts) == 0) {
+    return(tibble(
+      loc_id    = integer(),
+      day       = as.Date(character()),
+      utci      = double(),
+      utci_mean = double()
+    ))
+  }
+
+  time_indices <- if (!is.null(days_needed)) {
+    idx <- era5_time_indices(nc_path, c("t2m", "2m_temperature"), days_needed)
+    if (length(idx) == 0) return(tibble(
+      loc_id = integer(), day = as.Date(character()),
+      utci = double(), utci_mean = double()
+    ))
+    idx
+  } else {
+    NULL
+  }
+
   t2m   <- read_era5_variable(nc_path,
-              c("t2m", "2m_temperature"), locations_pts)
+              c("t2m", "2m_temperature"), locations_pts, time_indices)
   d2m   <- read_era5_variable(nc_path,
-              c("d2m", "2m_dewpoint_temperature"), locations_pts)
+              c("d2m", "2m_dewpoint_temperature"), locations_pts, time_indices)
   u10   <- read_era5_variable(nc_path,
-              c("u10", "10m_u_component_of_wind"), locations_pts)
+              c("u10", "10m_u_component_of_wind"), locations_pts, time_indices)
   v10   <- read_era5_variable(nc_path,
-              c("v10", "10m_v_component_of_wind"), locations_pts)
+              c("v10", "10m_v_component_of_wind"), locations_pts, time_indices)
   ssrd  <- read_era5_variable(nc_path,
-              c("ssrd", "surface_solar_radiation_downwards"), locations_pts)
+              c("ssrd", "surface_solar_radiation_downwards"), locations_pts, time_indices)
 
-  # Sanity check: all five variables should share the same time axis.
   stopifnot(length(t2m$times) == length(d2m$times),
             length(t2m$times) == length(u10$times),
             length(t2m$times) == length(v10$times),
             length(t2m$times) == length(ssrd$times))
 
-  # Unit conversions
-  t2m_C   <- t2m$values - 273.15        # K → °C
-  d2m_C   <- d2m$values - 273.15        # K → °C
+  t2m_C   <- t2m$values - 273.15
+  d2m_C   <- d2m$values - 273.15
   wind_ms <- sqrt(u10$values^2 + v10$values^2)
 
-  # De-accumulate SSRD: ERA5-Land returns accumulated J/m² since 00 UTC.
-  # Recover per-hour mean W/m² via finite differences before MRT.
   hour_of_day <- lubridate::hour(t2m$times)
   ssrd_Wm2    <- deaccumulate_ssrd(ssrd$values, hour_of_day)
 
-  # Relative humidity from dewpoint, in percent. comf::calcUTCI() expects RH%.
-  # RH = 100 × e_sat(T_d) / e_sat(T_a)
   rh_pct <- 100 * e_sat(d2m_C) / e_sat(t2m_C)
-  rh_pct[rh_pct > 100] <- 100  # clamp numerical artefacts
+  rh_pct[rh_pct > 100] <- 100
 
-  # Mean radiant temperature (Di Napoli et al. 2018 simplified form for
-  # gridded reanalysis inputs). MRT in °C from absorbed shortwave plus
-  # ambient longwave, using land-surface constants for Sahelian conditions:
-  #   albedo ≈ 0.30, projected-area factor ε_p ≈ 0.97, σ = 5.67e-8 W/m²/K⁴.
   sigma  <- 5.67e-8
   albedo <- 0.30
   eps_p  <- 0.97
@@ -614,24 +682,22 @@ compute_daily_utci <- function(nc_path, locations_pts, daily_stat) {
              (t2m_C + 273.15)^4)^0.25
   mrt_C  <- mrt_K - 273.15
 
-  # Hourly UTCI computation.
   n_loc <- nrow(t2m_C)
   n_t   <- ncol(t2m_C)
   utci_hourly <- matrix(NA_real_, n_loc, n_t)
 
   if (UTCI_SOURCE == "compute_in_script_package") {
-    # comf::calcUTCI(ta, tr, vel, rh) — air temperature (°C), mean radiant
-    # temperature (°C), wind speed at 10 m (m/s), relative humidity (%).
-    for (j in seq_len(n_t)) {
-      utci_hourly[, j] <- comf::calcUTCI(
-        ta  = t2m_C[, j],
-        tr  = mrt_C[, j],
-        vel = wind_ms[, j],
-        rh  = rh_pct[, j]
-      )
-    }
+    utci_hourly <- matrix(
+      calc_utci_vec(
+        ta  = as.vector(t2m_C),
+        tr  = as.vector(mrt_C),
+        vel = as.vector(wind_ms),
+        rh  = as.vector(rh_pct)
+      ),
+      nrow = n_loc,
+      ncol = n_t
+    )
   } else {
-    # Manual Bröde polynomial fallback (sourced from a separate helper).
     if (file.exists("utci_brode.R")) {
       source("utci_brode.R")
       utci_hourly <- utci_brode(t2m_C, mrt_C, wind_ms, rh_pct)
@@ -640,57 +706,99 @@ compute_daily_utci <- function(nc_path, locations_pts, daily_stat) {
     }
   }
 
-  # Aggregate to daily summary at each location.
-  # PRESERVE the actual loc_id from locations_pts rather than re-indexing.
-  hour_dates <- as.Date(t2m$times)
+  hour_dates  <- as.Date(t2m$times)
   unique_days <- sort(unique(hour_dates))
+  if (!is.null(days_needed)) {
+    unique_days <- sort(intersect(unique_days, as.Date(days_needed)))
+  }
 
   daily <- map_dfr(unique_days, function(d) {
     cols_today <- which(hour_dates == d)
     if (length(cols_today) == 0) return(NULL)
-    if (daily_stat == "max") {
-      vals <- apply(utci_hourly[, cols_today, drop = FALSE], 1,
-                    max, na.rm = TRUE)
-    } else if (daily_stat == "mean") {
-      vals <- rowMeans(utci_hourly[, cols_today, drop = FALSE], na.rm = TRUE)
-    } else {
-      stop("Unknown daily_stat: ", daily_stat)
-    }
-    # Replace -Inf (which arises when max() is applied to all-NA rows) with NA.
-    vals[!is.finite(vals)] <- NA_real_
-    tibble(loc_id = locations_pts$loc_id, day = d, utci = vals)
+    utci_max <- apply(utci_hourly[, cols_today, drop = FALSE], 1,
+                      max, na.rm = TRUE)
+    utci_avg <- rowMeans(utci_hourly[, cols_today, drop = FALSE], na.rm = TRUE)
+    utci_max[!is.finite(utci_max)] <- NA_real_
+    utci_avg[!is.finite(utci_avg)] <- NA_real_
+    tibble(
+      loc_id    = locations_pts$loc_id,
+      day       = d,
+      utci      = utci_max,
+      utci_mean = utci_avg
+    )
   })
 
   daily
 }
 
-# Iterate over month-tiles, computing daily UTCI and accumulating.
-month_files <- list.files(CLIMATE_DIR,
-                          pattern = "^era5_land_navrongo_\\d{6}\\.nc$",
-                          full.names = TRUE)
+# Only process month-tiles and (location, day) pairs present in extract_grid.
+extract_grid_ym <- extract_grid |>
+  mutate(year = lubridate::year(day), month = lubridate::month(day))
 
-daily_utci_list <- vector("list", length(month_files))
+months_needed <- extract_grid_ym |>
+  distinct(year, month) |>
+  arrange(year, month)
+
+month_files_all <- list.files(
+  CLIMATE_DIR,
+  pattern = "^era5_land_navrongo_\\d{6}\\.nc$",
+  full.names = TRUE
+)
+
+parse_month_file <- function(path) {
+  ym <- sub(".*era5_land_navrongo_(\\d{6})\\.nc$", "\\1", basename(path))
+  tibble(
+    path  = path,
+    year  = as.integer(substr(ym, 1L, 4L)),
+    month = as.integer(substr(ym, 5L, 6L))
+  )
+}
+
+month_index <- month_files_all |>
+  parse_month_file() |>
+  inner_join(months_needed, by = c("year", "month")) |>
+  arrange(year, month)
+
+cat(sprintf(
+  "UTCI computation scoped to %d month-tiles (of %d cached) covering %s (loc, day) pairs.\n",
+  nrow(month_index),
+  length(month_files_all),
+  format(nrow(extract_grid), big.mark = ",")
+))
+
+daily_utci_list <- vector("list", nrow(month_index))
 start_time <- Sys.time()
 
-for (k in seq_along(month_files)) {
+for (k in seq_len(nrow(month_index))) {
+  yy <- month_index$year[k]
+  mm <- month_index$month[k]
+  grid_month <- extract_grid_ym |>
+    filter(year == yy, month == mm)
+  locs_month <- locations |>
+    filter(loc_id %in% unique(grid_month$loc_id))
+  days_month <- unique(grid_month$day)
+
   daily_utci_list[[k]] <- compute_daily_utci(
-    nc_path        = month_files[k],
-    locations_pts  = locations,
-    daily_stat     = DAILY_STAT_PRIMARY
+    nc_path        = month_index$path[k],
+    locations_pts  = locs_month,
+    days_needed    = days_month
   )
-  if (k %% 12 == 0 || k == length(month_files)) {
+
+  if (k %% 12L == 0L || k == nrow(month_index)) {
     elapsed <- difftime(Sys.time(), start_time, units = "mins")
-    cat(sprintf("  Tile %d / %d — %.1f min elapsed\n",
-                k, length(month_files), as.numeric(elapsed)))
+    cat(sprintf("  Tile %d / %d (%04d-%02d) — %.1f min elapsed\n",
+                k, nrow(month_index), yy, mm, as.numeric(elapsed)))
   }
 }
 
-daily_utci <- bind_rows(daily_utci_list)
+daily_utci <- bind_rows(daily_utci_list) |>
+  distinct(loc_id, day, .keep_all = TRUE)
 
-# Write a single consolidated daily UTCI table for downstream use.
 saveRDS(daily_utci, file.path(UTCI_DIR, "daily_utci_consolidated.rds"))
-cat(sprintf("\nDaily UTCI table written: %s rows\n",
-            format(nrow(daily_utci), big.mark = ",")))
+cat(sprintf(
+  "\nDaily UTCI table written: %s rows (primary = daily max; utci_mean = daily mean)\n",
+  format(nrow(daily_utci), big.mark = ",")
+))
 ```
 
 
@@ -701,20 +809,97 @@ that the downstream DLNM, case-crossover, and trimester-regression scripts
 consume.
 
 ```{r assemble-exposure}
-# Join daily UTCI values to the (pregnancy, day) table.
+# Join daily UTCI values (primary = daily max) to the (pregnancy, day) table.
 preg_daily <- preg_days |>
-  left_join(daily_utci, by = c("loc_id", "day"))
+  left_join(daily_utci |> dplyr::select(loc_id, day, utci, utci_mean),
+            by = c("loc_id", "day"))
 
-# Diagnose any (pregnancy, day) gaps; these become NA in the lag matrix.
 n_total  <- nrow(preg_daily)
 n_filled <- sum(!is.na(preg_daily$utci))
-cat(sprintf("Pregnancy-day cells filled: %s of %s (%.2f%%)\n",
+cat(sprintf("Pregnancy-day cells filled (daily max): %s of %s (%.2f%%)\n",
             format(n_filled, big.mark = ","),
             format(n_total,  big.mark = ","),
             100 * n_filled / n_total))
+cat(sprintf("Pregnancy-day cells filled (daily mean sensitivity): %s of %s (%.2f%%)\n",
+            format(sum(!is.na(preg_daily$utci_mean)), big.mark = ","),
+            format(n_total, big.mark = ","),
+            100 * mean(!is.na(preg_daily$utci_mean))))
+
+# Shared helper: window summaries from a chosen daily UTCI column.
+window_summaries <- function(preg_daily_df, utci_col, suffix = "") {
+  preg_with_dates <- preg_daily_df |>
+    inner_join(preg |> dplyr::select(row_id, child_dob, preg_start_assumed),
+               by = "row_id") |>
+    mutate(days_from_conception = as.integer(day - preg_start_assumed))
+
+  trimester <- preg_with_dates |>
+    mutate(trimester = case_when(
+      days_from_conception >= 0L & days_from_conception <= TRIMESTER1_END ~ "t1",
+      days_from_conception > TRIMESTER1_END &
+        days_from_conception <= TRIMESTER2_END ~ "t2",
+      days_from_conception > TRIMESTER2_END & day <= child_dob ~ "t3",
+      TRUE ~ NA_character_
+    )) |>
+    filter(!is.na(trimester)) |>
+    group_by(row_id, trimester) |>
+    summarise(
+      mean_val = if (all(is.na(.data[[utci_col]]))) {
+        NA_real_
+      } else {
+        mean(.data[[utci_col]], na.rm = TRUE)
+      },
+      .groups = "drop"
+    ) |>
+    pivot_wider(names_from = trimester, values_from = mean_val, names_prefix = "") |>
+    rename(
+      !!paste0("t1_mean_utci", suffix) := t1,
+      !!paste0("t2_mean_utci", suffix) := t2,
+      !!paste0("t3_mean_utci", suffix) := t3
+    )
+
+  preg_mean <- preg_with_dates |>
+    filter(day >= preg_start_assumed, day <= child_dob) |>
+    group_by(row_id) |>
+    summarise(
+      !!paste0("preg_mean_utci", suffix) := if (all(is.na(.data[[utci_col]]))) {
+        NA_real_
+      } else {
+        mean(.data[[utci_col]], na.rm = TRUE)
+      },
+      .groups = "drop"
+    )
+
+  short_windows <- reduce(
+    map(OUTCOME_WINDOWS, function(n) {
+      preg_with_dates |>
+        mutate(lag = as.integer(child_dob - day)) |>
+        filter(lag >= 0L, lag < n) |>
+        group_by(row_id) |>
+        summarise(
+          !!paste0("last_", n, "d_mean_utci", suffix) := if (all(is.na(.data[[utci_col]]))) {
+            NA_real_
+          } else {
+            mean(.data[[utci_col]], na.rm = TRUE)
+          },
+          .groups = "drop"
+        )
+    }),
+    function(a, b) full_join(a, b, by = "row_id")
+  )
+
+  list(trimester = trimester, preg_mean = preg_mean, short_windows = short_windows)
+}
+
+primary_summaries <- window_summaries(preg_daily, "utci", suffix = "")
+sens_summaries    <- window_summaries(preg_daily, "utci_mean", suffix = "_sens")
+
+trimester_means <- primary_summaries$trimester
+preg_mean       <- primary_summaries$preg_mean
+short_windows   <- primary_summaries$short_windows
 
 # ----------------------------------------------------------------------------
 # DLNM daily lag matrix: one row per pregnancy, columns lag_0 ... lag_LAG_MAX.
+# Uses daily-max UTCI (primary statistic).
 # ----------------------------------------------------------------------------
 lag_matrix <- preg_daily |>
   inner_join(preg |> dplyr::select(row_id, child_dob), by = "row_id") |>
@@ -725,92 +910,38 @@ lag_matrix <- preg_daily |>
               values_from = utci,
               names_prefix = "lag_")
 
-# Ensure column order is lag_0, lag_1, ..., lag_30
 lag_cols <- paste0("lag_", LAG_MIN:LAG_MAX)
 missing_lag_cols <- setdiff(lag_cols, names(lag_matrix))
 for (m in missing_lag_cols) lag_matrix[[m]] <- NA_real_
 lag_matrix <- lag_matrix[, c("row_id", lag_cols)]
 
-# ----------------------------------------------------------------------------
-# Trimester and full-pregnancy means.
-# T1: days 0–91 post-conception   = (preg_start_assumed + 0)  ... (preg_start_assumed + 91)
-# T2: days 92–182                 = (preg_start_assumed + 92) ... (preg_start_assumed + 182)
-# T3: days 183–delivery           = (preg_start_assumed + 183)... child_dob
-# Full pregnancy: preg_start_assumed ... child_dob
-# ----------------------------------------------------------------------------
-preg_with_dates <- preg_daily |>
-  inner_join(preg |> dplyr::select(row_id, child_dob, preg_start_assumed),
-             by = "row_id") |>
-  mutate(days_from_conception = as.integer(day - preg_start_assumed))
-
-trimester_means <- preg_with_dates |>
-  mutate(trimester = case_when(
-    days_from_conception >= 0   & days_from_conception <= TRIMESTER1_END ~ "t1",
-    days_from_conception > TRIMESTER1_END & days_from_conception <= TRIMESTER2_END ~ "t2",
-    days_from_conception > TRIMESTER2_END & day <= child_dob ~ "t3",
-    TRUE ~ NA_character_
-  )) |>
-  filter(!is.na(trimester)) |>
-  group_by(row_id, trimester) |>
-  summarise(mean_utci = if (all(is.na(utci))) NA_real_ else mean(utci, na.rm = TRUE),
-            .groups = "drop") |>
-  pivot_wider(names_from = trimester, values_from = mean_utci,
-              names_prefix = "")
-
-preg_mean <- preg_with_dates |>
-  filter(day >= preg_start_assumed, day <= child_dob) |>
-  group_by(row_id) |>
-  summarise(preg_mean_utci = if (all(is.na(utci))) NA_real_ else mean(utci, na.rm = TRUE),
-            .groups = "drop")
-
-# ----------------------------------------------------------------------------
-# Outcome-anchored short-window means (last 7, 14, 30 days).
-# ----------------------------------------------------------------------------
-short_window_mean <- function(df, n_days, varname) {
-  df |>
-    mutate(lag = as.integer(child_dob - day)) |>
-    filter(lag >= 0, lag < n_days) |>
-    group_by(row_id) |>
-    summarise(!!varname := if (all(is.na(utci))) NA_real_ else mean(utci, na.rm = TRUE),
-              .groups = "drop")
-}
-
-short_windows <- reduce(
-  map(OUTCOME_WINDOWS, function(n) {
-    short_window_mean(preg_with_dates, n, paste0("last_", n, "d_mean_utci"))
-  }),
-  function(a, b) full_join(a, b, by = "row_id")
-)
-
-# ----------------------------------------------------------------------------
-# Coverage diagnostic per pregnancy.
-# ----------------------------------------------------------------------------
 coverage <- lag_matrix |>
   mutate(lag_cells_filled = rowSums(!is.na(across(starts_with("lag_")))),
-         lag_coverage_pct = round(100 * lag_cells_filled / (LAG_MAX - LAG_MIN + 1), 1)) |>
+         lag_coverage_pct = round(100 * lag_cells_filled / (LAG_MAX - LAG_MIN + 1L), 1)) |>
   dplyr::select(row_id, lag_cells_filled, lag_coverage_pct)
 
-# ----------------------------------------------------------------------------
-# Assemble the final exposure table.
-# ----------------------------------------------------------------------------
 exposure <- preg |>
   dplyr::select(row_id, child_id, motherid, locationid, lon, lat,
                 child_dob, preg_start_assumed) |>
-  left_join(lag_matrix,        by = "row_id") |>
-  left_join(trimester_means |>
-              rename(t1_mean_utci = t1, t2_mean_utci = t2, t3_mean_utci = t3),
-            by = "row_id") |>
-  left_join(preg_mean,         by = "row_id") |>
-  left_join(short_windows,     by = "row_id") |>
-  left_join(coverage,          by = "row_id")
+  left_join(lag_matrix, by = "row_id") |>
+  left_join(trimester_means, by = "row_id") |>
+  left_join(preg_mean, by = "row_id") |>
+  left_join(short_windows, by = "row_id") |>
+  left_join(sens_summaries$trimester, by = "row_id") |>
+  left_join(sens_summaries$preg_mean, by = "row_id") |>
+  left_join(sens_summaries$short_windows, by = "row_id") |>
+  left_join(coverage, by = "row_id")
 ```
 
 # Diagnostics
 
 ```{r diag-tables}
-exposure_vars <- c("t1_mean_utci", "t2_mean_utci", "t3_mean_utci",
-                   "preg_mean_utci",
-                   paste0("last_", OUTCOME_WINDOWS, "d_mean_utci"))
+exposure_vars <- c(
+  "t1_mean_utci", "t2_mean_utci", "t3_mean_utci", "preg_mean_utci",
+  paste0("last_", OUTCOME_WINDOWS, "d_mean_utci"),
+  "t1_mean_utci_sens", "t2_mean_utci_sens", "t3_mean_utci_sens", "preg_mean_utci_sens",
+  paste0("last_", OUTCOME_WINDOWS, "d_mean_utci_sens")
+)
 
 # Coverage summary
 coverage_summary <- tibble(
