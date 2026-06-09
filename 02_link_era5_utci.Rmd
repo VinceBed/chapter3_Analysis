@@ -722,7 +722,7 @@ compute_daily_utci <- function(nc_path, locations_pts, days_needed = NULL) {
     utci_avg[!is.finite(utci_avg)] <- NA_real_
     tibble(
       loc_id    = locations_pts$loc_id,
-      day       = d,
+      day       = as.Date(d),
       utci      = utci_max,
       utci_mean = utci_avg
     )
@@ -792,7 +792,8 @@ for (k in seq_len(nrow(month_index))) {
 }
 
 daily_utci <- bind_rows(daily_utci_list) |>
-  distinct(loc_id, day, .keep_all = TRUE)
+  distinct(loc_id, day, .keep_all = TRUE) |>
+  mutate(day = as.Date(day))
 
 saveRDS(daily_utci, file.path(UTCI_DIR, "daily_utci_consolidated.rds"))
 cat(sprintf(
@@ -811,8 +812,13 @@ consume.
 ```{r assemble-exposure}
 # Join daily UTCI values (primary = daily max) to the (pregnancy, day) table.
 preg_daily <- preg_days |>
-  left_join(daily_utci |> dplyr::select(loc_id, day, utci, utci_mean),
-            by = c("loc_id", "day"))
+  mutate(day = as.Date(day)) |>
+  left_join(
+    daily_utci |>
+      dplyr::select(loc_id, day, utci, utci_mean) |>
+      mutate(day = as.Date(day)),
+    by = c("loc_id", "day")
+  )
 
 n_total  <- nrow(preg_daily)
 n_filled <- sum(!is.na(preg_daily$utci))
