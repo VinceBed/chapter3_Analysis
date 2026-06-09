@@ -1,0 +1,913 @@
+---
+title: "Linking Daily UTCI Exposure to Pregnancies — Navrongo HDSS"
+subtitle: "Heat Stress and Perinatal Outcomes in Ghana"
+author: "Vincent"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = "#>"
+)
+```
+
+# Purpose and scope
+
+This document implements the climate-linkage step of the analytic plan
+accompanying Chapter 3 (Methodology, Version 8.0). It consumes the
+pregnancy-level spine produced by `01_build_spine.Rmd` and produces a
+pregnancy-level **daily UTCI exposure matrix** for the 0–30 day window
+pre-delivery, together with trimester and outcome-anchored summaries that
+feed downstream DLNM, case-crossover, and sensitivity analyses.
+
+Three operations are executed here.
+
+- **(i) ERA5-Land input acquisition.** Four hourly variables (2 m air
+  temperature, 2 m dewpoint temperature, 10 m wind speed, downward
+  shortwave radiation) are obtained for the Navrongo catchment bounding box
+  across the 1995–2020 analytic window. The acquisition method is
+  configurable: download-at-runtime via the Copernicus CDS API, or
+  read-from-disk if the inputs are already staged.
+- **(ii) Daily UTCI computation.** Hourly UTCI is computed at each unique
+  household coordinate using the Bröde et al. (2012) polynomial
+  approximation, then aggregated to daily summaries (daily maximum as the
+  primary statistic, daily mean as the sensitivity). The UTCI calculation
+  follows Di Napoli et al. (2018) for the mean radiant temperature
+  approximation suitable for gridded reanalysis inputs. The computation
+  method is configurable to support either in-script computation or
+  reading from a pre-computed daily UTCI archive.
+- **(iii) Pregnancy-level exposure assembly.** For each pregnancy in the
+  spine, the script extracts the daily UTCI series for the 0–30 day window
+  pre-delivery (the DLNM lag matrix), the trimester means (T1, T2, T3,
+  full-pregnancy), and the outcome-anchored short-window means (last 7,
+  14, 30 days). The resulting pregnancy-level exposure matrix is written
+  to `exposure.rds` for downstream DLNM and case-crossover scripts.
+
+**Note on workflow.** Per the code-then-execute arrangement agreed with
+NHRC, the researcher develops and tests this script against a sample
+dataset and stages the inputs for NHRC analysts to execute against the
+full extract on the Centre's secure infrastructure. The configuration
+block below exposes all environment-dependent paths and credentials so
+that the script runs identically on the development environment and on
+the Centre's compute environment.
+
+# Configuration
+
+The configuration block below exposes the operational choices flagged in
+the chapter discussion of `02_link_era5_utci.Rmd`. Three of these reflect
+unresolved decisions that may be settled in conversation with NHRC; the
+script is written to support each option without restructuring.
+
+```{r config}
+# ============================================================================
+# Paths
+# ============================================================================
+IN_PATH      <- "spine.rds"                # output of 01_build_spine.Rmd
+OUT_DIR      <- "."                         # where exposure.rds is written
+CLIMATE_DIR  <- "era5_land_navrongo"        # local cache of ERA5-Land inputs
+UTCI_DIR     <- file.path(CLIMATE_DIR, "utci_daily")  # daily UTCI rasters
+LOG_DIR      <- file.path(OUT_DIR, "logs")  # extraction diagnostics
+
+dir.create(CLIMATE_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(UTCI_DIR,    showWarnings = FALSE, recursive = TRUE)
+dir.create(LOG_DIR,     showWarnings = FALSE, recursive = TRUE)
+
+# ============================================================================
+# Catchment bounding box (Kassena-Nankana districts, Upper East Region)
+# Slight padding on each side to ensure no household falls on a tile edge.
+# ============================================================================
+BBOX <- list(
+  lat_min = 10.50, lat_max = 11.20,
+  lon_min = -1.45, lon_max = -0.75
+)
+
+# ============================================================================
+# Analytic window (matches Chapter 3 §3.8.1)
+# ============================================================================
+YEAR_MIN <- 1995L
+YEAR_MAX <- 2020L
+
+# ============================================================================
+# Exposure construction parameters (matches Chapter 3 §3.10.3)
+# ============================================================================
+LAG_MIN          <- 0L    # day of delivery
+LAG_MAX          <- 30L   # 30 days before delivery
+GESTATION_DAYS   <- 280L  # term gestation; sensitivity at 259 and 294
+TRIMESTER1_END   <- 91L   # days 0–91 post-conception
+TRIMESTER2_END   <- 182L  # days 92–182
+# Trimester 3 = days 183–280 (delivery)
+OUTCOME_WINDOWS  <- c(7L, 14L, 30L)  # last-N-day means
+
+# ============================================================================
+# Daily UTCI summary statistic (primary vs sensitivity)
+# ============================================================================
+DAILY_STAT_PRIMARY     <- "max"   # daily maximum UTCI
+DAILY_STAT_SENSITIVITY <- "mean"  # daily mean UTCI
+
+# ============================================================================
+# OPERATIONAL CHOICES — to be confirmed with NHRC climate-expertise lead
+# ============================================================================
+
+UTCI_SOURCE <- "compute_in_script_package"
+
+ERA5_ACQUISITION <- "cds_download"
+
+# ============================================================================
+# Copernicus CDS credentials (used only if ERA5_ACQUISITION == "cds_download")
+#
+# Before running this script on a new machine, configure a CDS Personal
+# Access Token (PAT) once per environment, for example:
+  library(ecmwfr)
+
+wf_set_key(
+  key  = "b8cda5a0-7a4d-4827-82b8-42257c851b96"
+)
+#
+# Obtain a PAT from https://cds.climate.copernicus.eu/profile after
+# accepting the ERA5-Land licence terms. Never paste the token into this
+# file or commit it to Git. [web:73][web:75][web:78][web:81]
+# ============================================================================
+```
+
+```{r libraries}
+# Core packages required regardless of configuration. Install on first
+# environment setup with:
+#   install.packages(c("dplyr","tidyr","lubridate","purrr","readr",
+#                      "stringr","terra","knitr","kableExtra"))
+#
+# Configuration-conditional packages 
+#   ERA5_ACQUISITION = "cds_download"  → install.packages("ecmwfr")
+#   UTCI_SOURCE      = "compute_in_script_package" → install.packages("comf")
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(lubridate)
+  library(purrr)
+  library(readr)
+  library(stringr)
+  library(terra)
+  library(knitr)
+  library(kableExtra)
+})
+
+# Conditionally-loaded packages: only required for specific configurations.
+# Loading them on demand keeps the script runnable in environments that
+# only need a subset of capabilities.
+load_if_needed <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Package '", pkg, "' is required for the chosen configuration but is not installed. ",
+         "Install with: install.packages('", pkg, "')")
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+if (ERA5_ACQUISITION == "cds_download")           load_if_needed("ecmwfr")
+if (UTCI_SOURCE      == "compute_in_script_package") load_if_needed("comf")
+```
+
+```{r helpers}
+nice_table <- function(x, caption = NULL, full_width = FALSE,
+                       wrap_col = NULL, wrap_width = "10cm") {
+  fmt <- knitr::is_html_output()
+  k <- kable(x, caption = caption, format.args = list(big.mark = ","),
+             booktabs = TRUE, longtable = TRUE)
+  if (fmt) {
+    k <- kable_styling(k,
+                       bootstrap_options = c("striped", "hover", "condensed"),
+                       full_width = full_width, position = "left")
+  } else {
+    k <- kable_styling(k,
+                       latex_options = c("striped", "hold_position", "repeat_header"),
+                       full_width = full_width, position = "left")
+  }
+  if (!is.null(wrap_col)) k <- column_spec(k, wrap_col, width = wrap_width)
+  k
+}
+
+# Defensive coordinate check: catches NA, infinite, and any value outside
+# the catchment bounding box (a sentinel like 0/0 or a swapped lat/lon).
+valid_coords <- function(lon, lat,
+                         lat_min = BBOX$lat_min, lat_max = BBOX$lat_max,
+                         lon_min = BBOX$lon_min, lon_max = BBOX$lon_max) {
+  is.finite(lon) & is.finite(lat) &
+    lon >= lon_min & lon <= lon_max &
+    lat >= lat_min & lat <= lat_max
+}
+```
+
+# Load the spine
+
+```{r load-spine}
+spine <- readRDS(IN_PATH)
+
+cat(sprintf("Spine rows (= unique children): %s\n", format(nrow(spine), big.mark = ",")))
+cat(sprintf("Birth-year range: %d–%d\n",
+            min(spine$birth_year, na.rm = TRUE),
+            max(spine$birth_year, na.rm = TRUE)))
+cat(sprintf("Distinct mothers: %s\n", format(dplyr::n_distinct(spine$motherid), big.mark = ",")))
+cat(sprintf("Distinct compounds: %s\n", format(dplyr::n_distinct(spine$locationid), big.mark = ",")))
+```
+
+## Coverage gate — geocodes
+
+Pregnancies with valid household coordinates enter the household-coordinate
+exposure linkage; the residual subset is held for the community-centroid
+sensitivity branch (§3.10.7, item i in Chapter 3).
+
+```{r gps-coverage}
+spine <- spine |>
+  mutate(coord_valid = valid_coords(gps_longitude, gps_latitude))
+
+gps_summary <- tibble(
+  metric = c("rows in spine",
+             "valid household coordinates",
+             "coordinates outside catchment bbox",
+             "missing coordinates",
+             "valid coordinate coverage (%)"),
+  value  = c(nrow(spine),
+             sum(spine$coord_valid, na.rm = TRUE),
+             sum(!is.na(spine$gps_latitude) & !spine$coord_valid),
+             sum(is.na(spine$gps_latitude) | is.na(spine$gps_longitude)),
+             round(100 * mean(spine$coord_valid, na.rm = TRUE), 2))
+)
+
+nice_table(gps_summary, caption = "GPS coverage diagnostics")
+
+# Primary exposure linkage uses only the geocoded subset.
+preg <- spine |>
+  filter(coord_valid,
+         birth_year >= YEAR_MIN, birth_year <= YEAR_MAX) |>
+  dplyr::select(child_id, motherid, locationid,
+                gps_longitude, gps_latitude,
+                child_dob, preg_start_assumed,
+                preg_t3_start, preg_last30, preg_last7) |>
+  rename(lon = gps_longitude, lat = gps_latitude) |>
+  # Defensive coercion: spine.rds may store dates as Date, POSIXct, or
+  # character depending on the upstream version. Coerce explicitly and
+  # drop any row where either the delivery date or the reconstructed
+  # pregnancy start is missing (these break seq.Date() downstream).
+  mutate(
+    child_dob          = as.Date(child_dob),
+    preg_start_assumed = as.Date(preg_start_assumed),
+    preg_t3_start      = as.Date(preg_t3_start),
+    preg_last30        = as.Date(preg_last30),
+    preg_last7         = as.Date(preg_last7)
+  ) |>
+  filter(!is.na(child_dob), !is.na(preg_start_assumed)) |>
+  mutate(row_id = row_number())
+
+cat(sprintf("\nPregnancies entering household-coordinate exposure linkage: %s\n",
+            format(nrow(preg), big.mark = ",")))
+```
+
+## Unique household locations
+
+Many pregnancies share a household coordinate. Extracting at the
+location-level (rather than the pregnancy level) makes the climate-linkage
+step approximately *k*-fold faster, where *k* is the average pregnancies
+per location. The exposure values are joined back to the pregnancy table
+via the `loc_id` index.
+
+```{r unique-locations}
+locations <- preg |>
+  distinct(lon, lat) |>
+  arrange(lat, lon) |>
+  mutate(loc_id = row_number())
+
+preg <- preg |>
+  left_join(locations, by = c("lon", "lat"))
+
+cat(sprintf("Unique household coordinates: %s\n",
+            format(nrow(locations), big.mark = ",")))
+cat(sprintf("Mean pregnancies per location: %.1f\n",
+            nrow(preg) / nrow(locations)))
+```
+
+# Build the (location, day) extraction grid
+
+For each pregnancy, the analytic window of interest is the union of:
+the daily DLNM lag window (`child_dob - 30 days` to `child_dob`); the
+trimester windows (`preg_start_assumed` to `child_dob`); and the
+outcome-anchored short windows (already covered by the DLNM window).
+The trimester windows extend further back in time than the DLNM
+window. The script builds the **union** of these as the (location, day)
+extraction grid.
+
+```{r needed-days}
+preg_windows <- preg |>
+  mutate(
+    win_start = pmin(preg_start_assumed, child_dob - days(LAG_MAX)),
+    win_end   = child_dob
+  ) |>
+  dplyr::select(row_id, loc_id, win_start, win_end)
+
+# Expand to one row per (pregnancy, day)
+preg_days <- preg_windows |>
+  rowwise() |>
+  mutate(day = list(seq.Date(win_start, win_end, by = "day"))) |>
+  ungroup() |>
+  unnest(day) |>
+  dplyr::select(row_id, loc_id, day)
+
+# (location, day) extraction grid — what climate data must be read
+extract_grid <- preg_days |>
+  distinct(loc_id, day) |>
+  arrange(loc_id, day)
+
+cat(sprintf("Total (pregnancy, day) pairs needed: %s\n",
+            format(nrow(preg_days), big.mark = ",")))
+cat(sprintf("Unique (location, day) pairs to extract: %s\n",
+            format(nrow(extract_grid), big.mark = ",")))
+cat(sprintf("Compression ratio: %.2fx\n",
+            nrow(preg_days) / nrow(extract_grid)))
+
+# Save the extraction grid to disk for the climate-acquisition step.
+saveRDS(extract_grid, file.path(LOG_DIR, "extract_grid.rds"))
+```
+
+# ERA5-Land input acquisition
+
+The script supports three acquisition modes via `ERA5_ACQUISITION` in the
+configuration block. Each pulls the four hourly inputs needed for UTCI:
+2 m air temperature (`2m_temperature`), 2 m dewpoint temperature
+(`2m_dewpoint_temperature`), 10 m u-wind and v-wind components
+(`10m_u_component_of_wind`, `10m_v_component_of_wind`), and surface
+downward solar radiation (`surface_solar_radiation_downwards`).
+
+## Option 2a — Download via Copernicus CDS
+
+```{r cds-download, eval = (ERA5_ACQUISITION == "cds_download")}
+cds_request <- function(year, month) {
+  first_day <- as.Date(sprintf("%04d-%02d-01", year, month))
+  n_days    <- lubridate::days_in_month(first_day)
+
+  list(
+    dataset_short_name = "reanalysis-era5-land",
+    variable           = c("2m_temperature",
+                           "2m_dewpoint_temperature",
+                           "10m_u_component_of_wind",
+                           "10m_v_component_of_wind",
+                           "surface_solar_radiation_downwards"),
+    year               = sprintf("%04d", year),
+    month              = sprintf("%02d", month),
+    day                = sprintf("%02d", seq_len(n_days)),
+    time               = sprintf("%02d:00", 0:23),
+    area               = c(BBOX$lat_max, BBOX$lon_min,
+                           BBOX$lat_min, BBOX$lon_max),
+    data_format        = "netcdf",
+    download_format    = "unarchived",
+    target             = sprintf("era5_land_navrongo_%04d%02d.nc", year, month)
+  )
+}
+
+download_one_month <- function(year, month, path, max_tries = 4) {
+  req <- cds_request(year, month)
+
+  for (attempt in seq_len(max_tries)) {
+    ok <- tryCatch({
+      ecmwfr::wf_request(
+        request  = req,
+        transfer = TRUE,
+        path     = path,
+        time_out = 3 * 3600,
+        verbose  = FALSE
+      )
+      TRUE
+    }, error = function(e) {
+      msg <- conditionMessage(e)
+      message(sprintf("Failed %04d-%02d on attempt %d/%d: %s",
+                      year, month, attempt, max_tries, msg))
+      FALSE
+    })
+
+    out_file <- file.path(path, sprintf("era5_land_navrongo_%04d%02d.nc", year, month))
+    if (ok && file.exists(out_file)) return(TRUE)
+
+    if (attempt < max_tries) {
+      Sys.sleep(30 * attempt)
+    }
+  }
+
+  FALSE
+}
+
+month_grid <- expand.grid(year = YEAR_MIN:YEAR_MAX, month = 1:12) |>
+  dplyr::arrange(year, month) |>
+  dplyr::mutate(
+    file = sprintf("era5_land_navrongo_%04d%02d.nc", year, month),
+    path = file.path(CLIMATE_DIR, file)
+  ) |>
+  dplyr::filter(!file.exists(path))
+
+if (nrow(month_grid) == 0) {
+  cat("All required ERA5-Land tiles already cached.\n")
+} else {
+  cat(sprintf("Downloading %d month-tiles from CDS...\n", nrow(month_grid)))
+
+  failed <- vector("list", 0)
+
+  for (i in seq_len(nrow(month_grid))) {
+    yy <- month_grid$year[i]
+    mm <- month_grid$month[i]
+
+    cat(sprintf("[%d/%d] %04d-%02d\n", i, nrow(month_grid), yy, mm))
+
+    success <- download_one_month(yy, mm, CLIMATE_DIR, max_tries = 4)
+
+    if (!success) {
+      failed[[length(failed) + 1]] <- data.frame(year = yy, month = mm)
+    }
+
+    if (i %% 6 == 0 || i == nrow(month_grid)) {
+      cat(sprintf("  completed %d / %d requests\n", i, nrow(month_grid)))
+    }
+  }
+
+  if (length(failed) > 0) {
+    failed_df <- dplyr::bind_rows(failed)
+    readr::write_csv(failed_df, file.path(LOG_DIR, "era5_failed_downloads.csv"))
+    cat(sprintf("Failed months logged to %s\n",
+                file.path(LOG_DIR, "era5_failed_downloads.csv")))
+  } else {
+    cat("All requested ERA5-Land tiles downloaded successfully.\n")
+  }
+}
+```
+
+
+# Compute daily UTCI
+
+The Bröde et al. (2012) polynomial approximation gives UTCI as a function
+of air temperature ($T_a$, °C), mean radiant temperature (MRT, °C), wind
+speed at 10 m above ground ($v_a$, m/s), and relative humidity
+($\text{RH}$, %). When `UTCI_SOURCE = "compute_in_script_package"` the
+script uses the `comf` R package (Schweiker 2016), which implements the
+Bröde polynomial as `comf::calcUTCI(ta, tr, vel, rh)`. The fully-manual
+fallback (`UTCI_SOURCE = "compute_in_script_manual"`) sources a
+`utci_brode.R` helper file that contains the same polynomial in
+explicit form.
+
+The mean radiant temperature is approximated following Di Napoli et al.
+(2018) using only ERA5-Land 2 m air temperature and de-accumulated
+downward shortwave radiation, with constants chosen for Sahelian
+land-surface conditions (albedo 0.30, projected-area factor 0.97).
+
+A subtle but consequential implementation detail: ERA5-Land's
+`surface_solar_radiation_downwards` (SSRD) is accumulated in J/m² from
+00:00 UTC to the forecast hour, not instantaneous W/m². To recover
+hourly mean W/m² for the MRT calculation, the script de-accumulates the
+SSRD field via successive differences before the unit conversion. This
+step matters: treating the raw accumulated value as a per-second mean
+would produce MRT estimates that are larger by approximately a factor of
+the hour-of-day, with substantial downstream bias in UTCI.
+
+## Option 1A/1C — Compute from ERA5-Land inputs
+
+```{r compute-utci, eval = (UTCI_SOURCE != "precomputed_daily")}
+# For each (year, month) tile, read the four input variables, compute
+# hourly UTCI at each unique household coordinate, aggregate to daily
+# summaries, and write a daily UTCI raster to UTCI_DIR.
+
+# ----------------------------------------------------------------------------
+# Helper: De-accumulate ERA5-Land hourly accumulated radiation.
+# ERA5-Land surface_solar_radiation_downwards (SSRD) is accumulated from
+# 00:00 UTC to the forecast hour. To recover the per-hour mean W/m² for
+# each hour-ending timestamp, we take the difference between successive
+# accumulated values and divide by 3600 (seconds in an hour). The 01:00
+# value is the accumulation from 00:00 to 01:00 and is used directly.
+# A daily reset is assumed at every 00:00 UTC timestamp.
+# ----------------------------------------------------------------------------
+deaccumulate_ssrd <- function(ssrd_accum_matrix, hour_of_day) {
+  # ssrd_accum_matrix: locations × hours, in J/m² (accumulated since 00 UTC)
+  # hour_of_day: integer 0..23 corresponding to each column of the matrix
+  n_loc <- nrow(ssrd_accum_matrix)
+  n_t   <- ncol(ssrd_accum_matrix)
+  out   <- matrix(NA_real_, n_loc, n_t)
+  for (j in seq_len(n_t)) {
+    if (hour_of_day[j] == 0) {
+      # 00:00 timestamp: accumulation has just reset; no preceding hour.
+      out[, j] <- 0
+    } else if (j == 1 || hour_of_day[j] == 1) {
+      # 01:00 timestamp: accumulation from 00:00 to 01:00, use directly.
+      out[, j] <- ssrd_accum_matrix[, j] / 3600
+    } else {
+      # All other hours: difference from previous hour, divide by 3600.
+      out[, j] <- (ssrd_accum_matrix[, j] - ssrd_accum_matrix[, j - 1]) / 3600
+    }
+  }
+  # SSRD must be non-negative; clamp small negative numerical artefacts to 0.
+  out[out < 0] <- 0
+  out
+}
+
+# ----------------------------------------------------------------------------
+# Helper: Magnus formula for saturation vapour pressure (hPa) from T (°C).
+# ----------------------------------------------------------------------------
+e_sat <- function(T_C) 6.112 * exp((17.62 * T_C) / (243.12 + T_C))
+
+# ----------------------------------------------------------------------------
+# Parse the hourly time axis from an ERA5-Land SpatRaster.
+# CDS NetCDFs often encode valid_time in layer names (e.g. t2m_valid_time=...)
+# rather than a GDAL-readable time dimension, so terra::time() returns NA.
+# ----------------------------------------------------------------------------
+parse_era5_times <- function(spat_rast) {
+  t <- terra::time(spat_rast)
+  if (length(t) == terra::nlyr(spat_rast) && !all(is.na(t))) {
+    return(t)
+  }
+  nm <- names(spat_rast)
+  if (any(grepl("valid_time=", nm, fixed = TRUE))) {
+    unix_sec <- as.numeric(sub(".*valid_time=", "", nm))
+    return(as.POSIXct(unix_sec, origin = "1970-01-01", tz = "UTC"))
+  }
+  stop(sprintf("Could not determine time axis for %s", basename(terra::sources(spat_rast)[1])))
+}
+
+# ----------------------------------------------------------------------------
+# Read one ERA5-Land variable from a NetCDF, returning a matrix of
+# (locations × time) values with associated timestamps. Handles both the
+# short-name and long-name variable conventions that CDS may return.
+# ----------------------------------------------------------------------------
+read_era5_variable <- function(nc_path, var_candidates, locations_pts) {
+  # Try each candidate name in turn; the first one that opens cleanly wins.
+  for (vn in var_candidates) {
+    sub_r <- tryCatch(
+      terra::rast(nc_path, subds = vn),
+      error = function(e) NULL
+    )
+    if (!is.null(sub_r)) {
+      pts <- terra::vect(as.matrix(locations_pts[, c("lon", "lat")]),
+                         crs = "EPSG:4326")
+      ex  <- terra::extract(sub_r, pts)[, -1, drop = FALSE]
+      return(list(
+        values    = as.matrix(ex),
+        times     = parse_era5_times(sub_r),
+        var_used  = vn
+      ))
+    }
+  }
+  stop(sprintf("None of the candidate variable names found in %s: %s",
+               basename(nc_path), paste(var_candidates, collapse = ", ")))
+}
+
+# ----------------------------------------------------------------------------
+# Main: compute daily UTCI summaries for one ERA5-Land month-tile.
+# ----------------------------------------------------------------------------
+compute_daily_utci <- function(nc_path, locations_pts, daily_stat) {
+
+  # Read each variable explicitly by trying both short and long names.
+  # This is more robust than parsing names() of the combined SpatRaster,
+  # because the CDS layer-naming conventions have changed over time and
+  # vary between the legacy and CDS-Beta API responses.
+  t2m   <- read_era5_variable(nc_path,
+              c("t2m", "2m_temperature"), locations_pts)
+  d2m   <- read_era5_variable(nc_path,
+              c("d2m", "2m_dewpoint_temperature"), locations_pts)
+  u10   <- read_era5_variable(nc_path,
+              c("u10", "10m_u_component_of_wind"), locations_pts)
+  v10   <- read_era5_variable(nc_path,
+              c("v10", "10m_v_component_of_wind"), locations_pts)
+  ssrd  <- read_era5_variable(nc_path,
+              c("ssrd", "surface_solar_radiation_downwards"), locations_pts)
+
+  # Sanity check: all five variables should share the same time axis.
+  stopifnot(length(t2m$times) == length(d2m$times),
+            length(t2m$times) == length(u10$times),
+            length(t2m$times) == length(v10$times),
+            length(t2m$times) == length(ssrd$times))
+
+  # Unit conversions
+  t2m_C   <- t2m$values - 273.15        # K → °C
+  d2m_C   <- d2m$values - 273.15        # K → °C
+  wind_ms <- sqrt(u10$values^2 + v10$values^2)
+
+  # De-accumulate SSRD: ERA5-Land returns accumulated J/m² since 00 UTC.
+  # Recover per-hour mean W/m² via finite differences before MRT.
+  hour_of_day <- lubridate::hour(t2m$times)
+  ssrd_Wm2    <- deaccumulate_ssrd(ssrd$values, hour_of_day)
+
+  # Relative humidity from dewpoint, in percent. comf::calcUTCI() expects RH%.
+  # RH = 100 × e_sat(T_d) / e_sat(T_a)
+  rh_pct <- 100 * e_sat(d2m_C) / e_sat(t2m_C)
+  rh_pct[rh_pct > 100] <- 100  # clamp numerical artefacts
+
+  # Mean radiant temperature (Di Napoli et al. 2018 simplified form for
+  # gridded reanalysis inputs). MRT in °C from absorbed shortwave plus
+  # ambient longwave, using land-surface constants for Sahelian conditions:
+  #   albedo ≈ 0.30, projected-area factor ε_p ≈ 0.97, σ = 5.67e-8 W/m²/K⁴.
+  sigma  <- 5.67e-8
+  albedo <- 0.30
+  eps_p  <- 0.97
+  mrt_K  <- ((ssrd_Wm2 * (1 - albedo) / (sigma * eps_p)) +
+             (t2m_C + 273.15)^4)^0.25
+  mrt_C  <- mrt_K - 273.15
+
+  # Hourly UTCI computation.
+  n_loc <- nrow(t2m_C)
+  n_t   <- ncol(t2m_C)
+  utci_hourly <- matrix(NA_real_, n_loc, n_t)
+
+  if (UTCI_SOURCE == "compute_in_script_package") {
+    # comf::calcUTCI(ta, tr, vel, rh) — air temperature (°C), mean radiant
+    # temperature (°C), wind speed at 10 m (m/s), relative humidity (%).
+    for (j in seq_len(n_t)) {
+      utci_hourly[, j] <- comf::calcUTCI(
+        ta  = t2m_C[, j],
+        tr  = mrt_C[, j],
+        vel = wind_ms[, j],
+        rh  = rh_pct[, j]
+      )
+    }
+  } else {
+    # Manual Bröde polynomial fallback (sourced from a separate helper).
+    if (file.exists("utci_brode.R")) {
+      source("utci_brode.R")
+      utci_hourly <- utci_brode(t2m_C, mrt_C, wind_ms, rh_pct)
+    } else {
+      stop("UTCI_SOURCE = 'compute_in_script_manual' but utci_brode.R is not present.")
+    }
+  }
+
+  # Aggregate to daily summary at each location.
+  # PRESERVE the actual loc_id from locations_pts rather than re-indexing.
+  hour_dates <- as.Date(t2m$times)
+  unique_days <- sort(unique(hour_dates))
+
+  daily <- map_dfr(unique_days, function(d) {
+    cols_today <- which(hour_dates == d)
+    if (length(cols_today) == 0) return(NULL)
+    if (daily_stat == "max") {
+      vals <- apply(utci_hourly[, cols_today, drop = FALSE], 1,
+                    max, na.rm = TRUE)
+    } else if (daily_stat == "mean") {
+      vals <- rowMeans(utci_hourly[, cols_today, drop = FALSE], na.rm = TRUE)
+    } else {
+      stop("Unknown daily_stat: ", daily_stat)
+    }
+    # Replace -Inf (which arises when max() is applied to all-NA rows) with NA.
+    vals[!is.finite(vals)] <- NA_real_
+    tibble(loc_id = locations_pts$loc_id, day = d, utci = vals)
+  })
+
+  daily
+}
+
+# Iterate over month-tiles, computing daily UTCI and accumulating.
+month_files <- list.files(CLIMATE_DIR,
+                          pattern = "^era5_land_navrongo_\\d{6}\\.nc$",
+                          full.names = TRUE)
+
+daily_utci_list <- vector("list", length(month_files))
+start_time <- Sys.time()
+
+for (k in seq_along(month_files)) {
+  daily_utci_list[[k]] <- compute_daily_utci(
+    nc_path        = month_files[k],
+    locations_pts  = locations,
+    daily_stat     = DAILY_STAT_PRIMARY
+  )
+  if (k %% 12 == 0 || k == length(month_files)) {
+    elapsed <- difftime(Sys.time(), start_time, units = "mins")
+    cat(sprintf("  Tile %d / %d — %.1f min elapsed\n",
+                k, length(month_files), as.numeric(elapsed)))
+  }
+}
+
+daily_utci <- bind_rows(daily_utci_list)
+
+# Write a single consolidated daily UTCI table for downstream use.
+saveRDS(daily_utci, file.path(UTCI_DIR, "daily_utci_consolidated.rds"))
+cat(sprintf("\nDaily UTCI table written: %s rows\n",
+            format(nrow(daily_utci), big.mark = ",")))
+```
+
+
+# Assemble pregnancy-level exposure matrix
+
+For each pregnancy in the analytic cohort, we now construct the columns
+that the downstream DLNM, case-crossover, and trimester-regression scripts
+consume.
+
+```{r assemble-exposure}
+# Join daily UTCI values to the (pregnancy, day) table.
+preg_daily <- preg_days |>
+  left_join(daily_utci, by = c("loc_id", "day"))
+
+# Diagnose any (pregnancy, day) gaps; these become NA in the lag matrix.
+n_total  <- nrow(preg_daily)
+n_filled <- sum(!is.na(preg_daily$utci))
+cat(sprintf("Pregnancy-day cells filled: %s of %s (%.2f%%)\n",
+            format(n_filled, big.mark = ","),
+            format(n_total,  big.mark = ","),
+            100 * n_filled / n_total))
+
+# ----------------------------------------------------------------------------
+# DLNM daily lag matrix: one row per pregnancy, columns lag_0 ... lag_LAG_MAX.
+# ----------------------------------------------------------------------------
+lag_matrix <- preg_daily |>
+  inner_join(preg |> dplyr::select(row_id, child_dob), by = "row_id") |>
+  mutate(lag = as.integer(child_dob - day)) |>
+  filter(lag >= LAG_MIN, lag <= LAG_MAX) |>
+  pivot_wider(id_cols     = row_id,
+              names_from  = lag,
+              values_from = utci,
+              names_prefix = "lag_")
+
+# Ensure column order is lag_0, lag_1, ..., lag_30
+lag_cols <- paste0("lag_", LAG_MIN:LAG_MAX)
+missing_lag_cols <- setdiff(lag_cols, names(lag_matrix))
+for (m in missing_lag_cols) lag_matrix[[m]] <- NA_real_
+lag_matrix <- lag_matrix[, c("row_id", lag_cols)]
+
+# ----------------------------------------------------------------------------
+# Trimester and full-pregnancy means.
+# T1: days 0–91 post-conception   = (preg_start_assumed + 0)  ... (preg_start_assumed + 91)
+# T2: days 92–182                 = (preg_start_assumed + 92) ... (preg_start_assumed + 182)
+# T3: days 183–delivery           = (preg_start_assumed + 183)... child_dob
+# Full pregnancy: preg_start_assumed ... child_dob
+# ----------------------------------------------------------------------------
+preg_with_dates <- preg_daily |>
+  inner_join(preg |> dplyr::select(row_id, child_dob, preg_start_assumed),
+             by = "row_id") |>
+  mutate(days_from_conception = as.integer(day - preg_start_assumed))
+
+trimester_means <- preg_with_dates |>
+  mutate(trimester = case_when(
+    days_from_conception >= 0   & days_from_conception <= TRIMESTER1_END ~ "t1",
+    days_from_conception > TRIMESTER1_END & days_from_conception <= TRIMESTER2_END ~ "t2",
+    days_from_conception > TRIMESTER2_END & day <= child_dob ~ "t3",
+    TRUE ~ NA_character_
+  )) |>
+  filter(!is.na(trimester)) |>
+  group_by(row_id, trimester) |>
+  summarise(mean_utci = if (all(is.na(utci))) NA_real_ else mean(utci, na.rm = TRUE),
+            .groups = "drop") |>
+  pivot_wider(names_from = trimester, values_from = mean_utci,
+              names_prefix = "")
+
+preg_mean <- preg_with_dates |>
+  filter(day >= preg_start_assumed, day <= child_dob) |>
+  group_by(row_id) |>
+  summarise(preg_mean_utci = if (all(is.na(utci))) NA_real_ else mean(utci, na.rm = TRUE),
+            .groups = "drop")
+
+# ----------------------------------------------------------------------------
+# Outcome-anchored short-window means (last 7, 14, 30 days).
+# ----------------------------------------------------------------------------
+short_window_mean <- function(df, n_days, varname) {
+  df |>
+    mutate(lag = as.integer(child_dob - day)) |>
+    filter(lag >= 0, lag < n_days) |>
+    group_by(row_id) |>
+    summarise(!!varname := if (all(is.na(utci))) NA_real_ else mean(utci, na.rm = TRUE),
+              .groups = "drop")
+}
+
+short_windows <- reduce(
+  map(OUTCOME_WINDOWS, function(n) {
+    short_window_mean(preg_with_dates, n, paste0("last_", n, "d_mean_utci"))
+  }),
+  function(a, b) full_join(a, b, by = "row_id")
+)
+
+# ----------------------------------------------------------------------------
+# Coverage diagnostic per pregnancy.
+# ----------------------------------------------------------------------------
+coverage <- lag_matrix |>
+  mutate(lag_cells_filled = rowSums(!is.na(across(starts_with("lag_")))),
+         lag_coverage_pct = round(100 * lag_cells_filled / (LAG_MAX - LAG_MIN + 1), 1)) |>
+  dplyr::select(row_id, lag_cells_filled, lag_coverage_pct)
+
+# ----------------------------------------------------------------------------
+# Assemble the final exposure table.
+# ----------------------------------------------------------------------------
+exposure <- preg |>
+  dplyr::select(row_id, child_id, motherid, locationid, lon, lat,
+                child_dob, preg_start_assumed) |>
+  left_join(lag_matrix,        by = "row_id") |>
+  left_join(trimester_means |>
+              rename(t1_mean_utci = t1, t2_mean_utci = t2, t3_mean_utci = t3),
+            by = "row_id") |>
+  left_join(preg_mean,         by = "row_id") |>
+  left_join(short_windows,     by = "row_id") |>
+  left_join(coverage,          by = "row_id")
+```
+
+# Diagnostics
+
+```{r diag-tables}
+exposure_vars <- c("t1_mean_utci", "t2_mean_utci", "t3_mean_utci",
+                   "preg_mean_utci",
+                   paste0("last_", OUTCOME_WINDOWS, "d_mean_utci"))
+
+# Coverage summary
+coverage_summary <- tibble(
+  variable = exposure_vars,
+  pct_non_missing = sapply(exposure_vars, function(v)
+    round(100 * mean(!is.na(exposure[[v]])), 1)),
+  median_utci = sapply(exposure_vars, function(v)
+    round(median(exposure[[v]], na.rm = TRUE), 1)),
+  p10 = sapply(exposure_vars, function(v)
+    round(quantile(exposure[[v]], 0.10, na.rm = TRUE), 1)),
+  p90 = sapply(exposure_vars, function(v)
+    round(quantile(exposure[[v]], 0.90, na.rm = TRUE), 1))
+)
+
+nice_table(coverage_summary,
+           caption = "Per-pregnancy exposure summary — coverage and distribution of derived window means")
+
+# DLNM lag-matrix coverage
+lag_coverage_summary <- tibble(
+  metric = c("pregnancies with 100% lag coverage",
+             "pregnancies with ≥95% lag coverage",
+             "pregnancies with ≥80% lag coverage",
+             "median lag coverage (%)"),
+  value  = c(sum(exposure$lag_coverage_pct == 100),
+             sum(exposure$lag_coverage_pct >= 95),
+             sum(exposure$lag_coverage_pct >= 80),
+             round(median(exposure$lag_coverage_pct), 1))
+)
+nice_table(lag_coverage_summary,
+           caption = "DLNM lag-matrix coverage (lag_0 through lag_30)")
+```
+
+# Persist outputs
+
+```{r save}
+saveRDS(exposure, file.path(OUT_DIR, "exposure.rds"))
+write_csv(exposure |> dplyr::select(-starts_with("lag_")),
+          file.path(OUT_DIR, "exposure_summaries.csv"))
+
+cat(sprintf("Files written:\n  %s\n  %s\n",
+            file.path(OUT_DIR, "exposure.rds"),
+            file.path(OUT_DIR, "exposure_summaries.csv")))
+```
+
+# Expected diagnostic counts
+
+The script has been developed against the development sample produced by
+`01_build_spine.Rmd`. Sample-stage and full-data expected counts are
+documented below; the full-data figures will be reported once the script
+is executed against the full extract by NHRC analysts.
+
+```{r expected, echo = FALSE}
+tibble(
+  metric = c("pregnancies entering exposure linkage (full extract)",
+             "unique household coordinates (full extract)",
+             "(location, day) pairs to extract",
+             "ERA5-Land month-tiles required",
+             "expected (pregnancy, day) cells in lag matrix",
+             "expected (pregnancy, day) cells in pregnancy window"),
+  expected_value = c("approximately 94,649 (97.5% of 97,045)",
+                     "approximately 4,000–6,000",
+                     "approximately 23,500,000",
+                     "312 (1995–2020 × 12 months)",
+                     paste0("approximately ", format(94649 * 31, big.mark = ",")),
+                     paste0("approximately ", format(94649 * 280, big.mark = ",")))
+) |>
+  nice_table(caption = "Expected diagnostic counts at full-data execution",
+             wrap_col = 1, wrap_width = "9cm")
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
+
+# Next steps
+
+With `exposure.rds` in hand, the immediate items are, in order:
+
+1. **Validate the exposure construction** against substantive checks: the
+   seasonal pattern of daily UTCI within the catchment (peaks in
+   hot-dry season, troughs in dry-cool harmattan), the spatial pattern
+   across the catchment (which should be modest given the small
+   geographic extent), and the year-on-year trend (which should track
+   the regional warming signal). These checks belong in
+   `03_phase1_descriptive.Rmd` rather than this script.
+
+2. **Construct the DLNM cross-basis** in `05_phase3_dlnm_perinatal.Rmd`.
+   The cross-basis takes the daily lag matrix from `exposure.rds` and
+   produces a set of model-matrix columns via `dlnm::crossbasis()`. The
+   cross-basis is the substantive output that enters the Bayesian DLNM in
+   Phase 3.
+
+3. **Run the community-centroid sensitivity branch** in
+   `09_phase7_sensitivity.Rmd`. For the 2.5% of pregnancies without
+   household coordinates, the climate linkage uses a community-centroid
+   coordinate derived from `locationid`-level aggregation of the geocoded
+   subset. The structure of `02_link_era5_utci.Rmd` is reusable for this
+   branch with a single change at the GPS-coverage gate.
