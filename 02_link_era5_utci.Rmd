@@ -22,10 +22,13 @@ knitr::opts_chunk$set(
 )
 
 # Defaults so conditional chunk eval= never fails before the config chunk runs.
-ERA5_ACQUISITION <- "cds_download"
-UTCI_SOURCE      <- "compute_in_script_package"
-RUN_CDS_DOWNLOAD <- TRUE
-RUN_UTCI_COMPUTE <- TRUE
+ERA5_ACQUISITION     <- "cds_download"
+UTCI_SOURCE          <- "local_ecmwf_daily"
+RUN_LOCAL_DAILY      <- TRUE
+RUN_CDS_DOWNLOAD     <- FALSE
+RUN_UTCI_PRODUCT     <- FALSE
+RUN_UTCI_COMPUTE     <- FALSE
+RUN_UTCI_PRECOMPUTED <- TRUE
 ```
 
 # Purpose and scope
@@ -45,14 +48,14 @@ Three operations are executed here.
   across the 1995–2020 analytic window. The acquisition method is
   configurable: download-at-runtime via the Copernicus CDS API, or
   read-from-disk if the inputs are already staged.
-- **(ii) Daily UTCI computation.** Hourly UTCI is computed at each unique
-  household coordinate using the Bröde et al. (2012) polynomial
-  approximation, then aggregated to daily summaries (daily maximum as the
-  primary statistic, daily mean as the sensitivity). The UTCI calculation
-  follows Di Napoli et al. (2018) for the mean radiant temperature
-  approximation suitable for gridded reanalysis inputs. The computation
-  method is configurable to support either in-script computation or
-  reading from a pre-computed daily UTCI archive.
+- **(ii) Daily UTCI exposure.** The exposure is the **daily maximum UTCI**
+  from ECMWF's pre-computed daily product (the same product used in
+  Chapter 2, read here at daily resolution). Each file is one NetCDF per day
+  carrying `utci_daily_min` and `utci_daily_max`; only the maximum is used.
+  Mean radiant temperature is computed by ECMWF from the full ERA5 radiation
+  fields, so the exposure does not depend on any in-script radiation
+  modelling. The source is configurable, but the default reads the daily
+  files already staged on disk.
 - **(iii) Pregnancy-level exposure assembly.** For each pregnancy in the
   spine, the script extracts the daily UTCI series for the 0–30 day window
   pre-delivery (the DLNM lag matrix), the trimester means (T1, T2, T3,
@@ -81,12 +84,17 @@ script is written to support each option without restructuring.
 # ============================================================================
 IN_PATH      <- "spine.rds"                # output of 01_build_spine.Rmd
 OUT_DIR      <- "."                         # where exposure.rds is written
-CLIMATE_DIR  <- "era5_land_navrongo"        # local cache of ERA5-Land inputs
-UTCI_DIR     <- file.path(CLIMATE_DIR, "utci_daily")  # daily UTCI rasters
+
+# Directory holding the downloaded ECMWF daily UTCI files, one NetCDF per day,
+# named ECMWF_utci_daily_stats_YYYYMMDD_v1.1_con*.nc, each with the layers
+# utci_daily_min and utci_daily_max. This is the same product used in
+# Chapter 2, read here at daily resolution for the DLNM lag matrix.
+UTCI_DIR     <- "C:/Users/bedia/Downloads/Chapter 3_Dissertation"
+
+CLIMATE_DIR  <- "era5_land_navrongo"        # cache for the in-script ERA5 path (legacy)
 LOG_DIR      <- file.path(OUT_DIR, "logs")  # extraction diagnostics
 
 dir.create(CLIMATE_DIR, showWarnings = FALSE, recursive = TRUE)
-dir.create(UTCI_DIR,    showWarnings = FALSE, recursive = TRUE)
 dir.create(LOG_DIR,     showWarnings = FALSE, recursive = TRUE)
 
 # ============================================================================
@@ -116,22 +124,80 @@ TRIMESTER2_END   <- 182L  # days 92–182
 OUTCOME_WINDOWS  <- c(7L, 14L, 30L)  # last-N-day means
 
 # ============================================================================
-# Daily UTCI summary statistic (primary vs sensitivity)
+# Daily UTCI summary statistic
+# Chapter 3 is an acute-heat-stress study: the exposure is the daily MAXIMUM
+# UTCI throughout. The ECMWF daily files carry utci_daily_min and
+# utci_daily_max; only the maximum is used. The percentile and heatwave
+# metrics below are defined on the same daily-maximum distribution, so the
+# whole exposure apparatus is internally consistent.
 # ============================================================================
-DAILY_STAT_PRIMARY     <- "max"   # daily maximum UTCI
-DAILY_STAT_SENSITIVITY <- "mean"  # daily mean UTCI
+DAILY_STAT_PRIMARY     <- "max"   # daily maximum UTCI — the sole exposure
+
+# ============================================================================
+# Percentile / heatwave exposure metrics (carried over from Chapter 2).
+# Location-specific percentiles: each grid cell's own UTCI distribution over
+# the analytic window defines its p90/p95 thresholds. A heatwave run is a
+# consecutive spell of days at or above the p90 threshold.
+# ============================================================================
+PERCENTILES        <- c(90, 95)   # location-specific exposure percentiles
+HEATWAVE_PCTL      <- 90          # threshold percentile for run-length metric
+HEATWAVE_MIN_RUN   <- 2L          # minimum consecutive days to count as a run
 
 # ============================================================================
 # OPERATIONAL CHOICES — to be confirmed with NHRC climate-expertise lead
 # ============================================================================
-
-UTCI_SOURCE <- "compute_in_script_package"
+#
+# Choice 1: UTCI computation source. A first run computing MRT in-script from
+# ERA5-Land's downward-shortwave flux alone produced daily-MAXIMUM UTCI that
+# was implausibly high (median ~35 °C across all seasons, with almost no
+# seasonal contrast). The cause is that MRT cannot be computed correctly from
+# ERA5-Land alone: a defensible mean-radiant-temperature calculation (Di
+# Napoli et al. 2018) needs the direct-beam shortwave (fdir) and the net
+# short- and long-wave fluxes (ssr, str, strd), which ERA5-Land does not
+# provide in the form the calculation requires. ECMWF already computed UTCI
+# correctly from full ERA5 and published it as a ready-to-use daily product;
+# reading that product is therefore both more correct and less code than any
+# in-script reconstruction from ERA5-Land. The options below are ordered from
+# most to least recommended:
+#
+# Choice 1: UTCI source. The default reads the ECMWF pre-computed daily UTCI
+# files already downloaded for Chapter 2 (one NetCDF per day, with the layers
+# utci_daily_min and utci_daily_max). These embed the correct mean radiant
+# temperature computed by ECMWF from the full ERA5 radiation fields, so the
+# inflation seen in an earlier in-script run (median ~35 °C across all
+# seasons, no seasonal contrast) does not arise. The options below are
+# ordered from most to least recommended:
+#
+#   "local_ecmwf_daily"         — read the local ECMWF daily UTCI files in
+#                                 UTCI_DIR (RECOMMENDED; the default). One
+#                                 NetCDF per day; correct MRT already embedded.
+#                                 This is the same product Chapter 2 used.
+#   "cds_utci_product"          — download ECMWF daily UTCI from the CDS
+#                                 "derived-utci-historical" dataset if the
+#                                 local files are not present.
+#   "compute_in_script_full"    — compute MRT via the full Di Napoli (2018)
+#                                 radiation balance; REQUIRES the full ERA5
+#                                 single-levels radiation variables, NOT
+#                                 ERA5-Land. Use only if those inputs are
+#                                 staged. See the MRT section for caveats.
+#   "compute_in_script_package" — DEPRECATED. ERA5-Land + simplified MRT.
+#                                 Retained only for reproducing the first run;
+#                                 known to inflate daily-max UTCI. Do not use
+#                                 for analysis.
+UTCI_SOURCE <- "local_ecmwf_daily"
 
 ERA5_ACQUISITION <- "cds_download"
 
 # Chunk flags consumed by knitr eval= options (updated here after paths/modes set).
-RUN_CDS_DOWNLOAD <- (ERA5_ACQUISITION == "cds_download")
-RUN_UTCI_COMPUTE <- (UTCI_SOURCE != "precomputed_daily")
+RUN_LOCAL_DAILY      <- (UTCI_SOURCE == "local_ecmwf_daily")
+RUN_CDS_DOWNLOAD     <- (ERA5_ACQUISITION == "cds_download" &&
+                          UTCI_SOURCE %in% c("compute_in_script_full",
+                                             "compute_in_script_package"))
+RUN_UTCI_PRODUCT     <- (UTCI_SOURCE == "cds_utci_product")
+RUN_UTCI_COMPUTE     <- (UTCI_SOURCE %in% c("compute_in_script_full",
+                                            "compute_in_script_package"))
+RUN_UTCI_PRECOMPUTED <- (UTCI_SOURCE %in% c("local_ecmwf_daily",
+                                            "cds_utci_product"))
 
 # ============================================================================
 # Copernicus CDS credentials (used only if ERA5_ACQUISITION == "cds_download")
@@ -212,12 +278,131 @@ valid_coords <- function(lon, lat,
     lon >= lon_min & lon <= lon_max &
     lat >= lat_min & lat <= lat_max
 }
+
+# --- Shared climate helpers (needed by both the UTCI-product path and the
+# in-script ERA5-Land path, so defined here in an always-run chunk) ---------
+
+# Configure Copernicus CDS access from an environment variable. Never store
+# the token in the script. Set CDS_API_KEY in the session or the .Renviron.
+configure_cds <- function() {
+  load_if_needed("ecmwfr")
+  key <- Sys.getenv("CDS_API_KEY", unset = "")
+  if (nzchar(key)) ecmwfr::wf_set_key(key = key)
+}
+
+# Robustly parse the hourly time axis from a CDS NetCDF SpatRaster. CDS files
+# often encode valid_time in the layer names rather than a GDAL-readable time
+# dimension, so terra::time() can return NA.
+parse_era5_times <- function(spat_rast) {
+  t <- terra::time(spat_rast)
+  if (length(t) == terra::nlyr(spat_rast) && !all(is.na(t))) return(t)
+  nm <- names(spat_rast)
+  if (any(grepl("valid_time=", nm, fixed = TRUE))) {
+    unix_sec <- as.numeric(sub(".*valid_time=", "", nm))
+    return(as.POSIXct(unix_sec, origin = "1970-01-01", tz = "UTC"))
+  }
+  stop(sprintf("Could not determine time axis for %s",
+               basename(terra::sources(spat_rast)[1])))
+}
+
+# Cosine of the solar zenith angle at given coordinates and UTC times,
+# via standard astronomical formulae (Michalsky 1988 simplified). Returns a
+# locations × times matrix. Used by the full Di Napoli (2018) MRT path.
+solar_cos_zenith <- function(lat, lon, times_utc) {
+  lat_r <- lat * pi / 180
+  # Day-of-year and fractional UTC hour
+  doy  <- as.numeric(format(times_utc, "%j"))
+  hutc <- as.numeric(format(times_utc, "%H")) +
+          as.numeric(format(times_utc, "%M")) / 60
+  # Solar declination (radians)
+  decl <- 0.409 * sin(2 * pi / 365 * doy - 1.39)
+  # Equation of time (minutes) → hour-angle correction
+  B   <- 2 * pi * (doy - 81) / 364
+  eot <- 9.87 * sin(2 * B) - 7.53 * cos(B) - 1.5 * sin(B)
+  # Build the locations × times matrix
+  n_loc <- length(lat); n_t <- length(times_utc)
+  out <- matrix(NA_real_, n_loc, n_t)
+  for (j in seq_len(n_t)) {
+    # Local solar time hour angle (degrees → radians); lon east-positive
+    tst <- hutc[j] * 60 + eot[j] + 4 * lon
+    ha  <- ((tst / 4) - 180) * pi / 180
+    out[, j] <- sin(lat_r) * sin(decl[j]) +
+                cos(lat_r) * cos(decl[j]) * cos(ha)
+  }
+  out
+}
+
+# --- Helpers carried over from the Chapter 2 daily pipeline, adapted to read
+# the ECMWF daily UTCI files (one NetCDF per day, layers utci_daily_min and
+# utci_daily_max). These are proven against the actual downloaded files. ------
+
+# Parse the calendar date from an ECMWF daily filename. The date key is taken
+# from the filename (e.g. ..._stats_19950115_v1.1_...) rather than the
+# embedded time dimension, which is more robust to malformed time axes.
+parse_date_from_filename <- function(filepath) {
+  x  <- basename(filepath)
+  m1 <- regmatches(x, regexpr("(19|20)\\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])", x))
+  if (length(m1) == 1 && nchar(m1) == 8) return(as.Date(m1, "%Y%m%d"))
+  m2 <- regmatches(x, regexpr("(19|20)\\d{2}[-_](0[1-9]|1[0-2])[-_](0[1-9]|[12]\\d|3[01])", x))
+  if (length(m2) == 1 && nchar(m2) == 10) {
+    return(as.Date(paste0(substr(m2,1,4), "-", substr(m2,6,7), "-", substr(m2,9,10))))
+  }
+  as.Date(NA)
+}
+
+# Select the requested daily statistic from an ECMWF daily SpatRaster.
+# The files carry utci_daily_min and utci_daily_max. Chapter 3 uses "max"
+# (the sole exposure). The "min" and midrange options are provided only for
+# completeness; the midrange (min+max)/2 is NOT the true daily mean and is
+# not used as an exposure anywhere in this pipeline.
+get_daily_layer <- function(r, metric = DAILY_STAT_PRIMARY) {
+  nms <- names(r)
+  if (all(c("utci_daily_min", "utci_daily_max") %in% nms)) {
+    rmin <- r[["utci_daily_min"]]
+    rmax <- r[["utci_daily_max"]]
+    if (metric == "min")      return(rmin)
+    if (metric == "max")      return(rmax)
+    if (metric == "midrange") return((rmin + rmax) / 2)  # not a daily mean
+  }
+  if (any(grepl("utci", nms, ignore.case = TRUE))) {
+    return(r[[which(grepl("utci", nms, ignore.case = TRUE))[1]]])
+  }
+  r[[1]]
+}
+
+# Some CDS downloads arrive as zip-disguised NetCDFs. Detect and repair them
+# so terra::rast() can open them.
+is_zipfile <- function(f) {
+  con <- file(f, "rb"); on.exit(close(con))
+  sig <- readBin(con, what = "raw", n = 2)
+  identical(sig, as.raw(c(0x50, 0x4B)))
+}
+
+fix_zip_nc <- function(f, out_dir = tempdir()) {
+  td <- tempfile("unz_"); dir.create(td)
+  on.exit(unlink(td, recursive = TRUE), add = TRUE)
+  utils::unzip(f, exdir = td)
+  inner <- list.files(td, pattern = "\\.nc$", full.names = TRUE, recursive = TRUE)
+  if (length(inner) == 0) { warning("Zip had no .nc inside: ", f); return(NA_character_) }
+  dest <- file.path(out_dir, basename(f))
+  file.copy(inner[1], dest, overwrite = TRUE)
+  dest
+}
+
+# Detect whether a layer is in Kelvin (ECMWF UTCI ships in K) and needs
+# conversion to °C.
+is_kelvin <- function(r_layer) {
+  v <- terra::values(r_layer); v <- v[!is.na(v)]
+  if (length(v) == 0) return(FALSE)
+  mean(v[seq_len(min(500, length(v)))], na.rm = TRUE) > 100
+}
 ```
 
 # Load the spine
 
 ```{r load-spine}
-spine <- readRDS(IN_PATH)
+#Directory need to be changed
+spine <- readRDS("C:/Users/bedia/Downloads/Chapter 3_Dissertation/spine.rds")
 
 cat(sprintf("Spine rows (= unique children): %s\n", format(nrow(spine), big.mark = ",")))
 cat(sprintf("Birth-year range: %d–%d\n",
@@ -347,159 +532,281 @@ saveRDS(extract_grid, file.path(LOG_DIR, "extract_grid.rds"))
 
 # ERA5-Land input acquisition
 
-The script supports three acquisition modes via `ERA5_ACQUISITION` in the
-configuration block. Each pulls the four hourly inputs needed for UTCI:
-2 m air temperature (`2m_temperature`), 2 m dewpoint temperature
+This section applies only when `UTCI_SOURCE` is one of the in-script
+computation paths (`compute_in_script_full` or `compute_in_script_package`),
+which read raw ERA5 inputs. Under the recommended `cds_utci_product` path the
+script instead downloads ECMWF's pre-computed daily UTCI directly (see the
+next section), and this acquisition step is skipped.
+
+When it runs, this step pulls the hourly inputs needed for UTCI: 2 m air
+temperature (`2m_temperature`), 2 m dewpoint temperature
 (`2m_dewpoint_temperature`), 10 m u-wind and v-wind components
-(`10m_u_component_of_wind`, `10m_v_component_of_wind`), and surface
-downward solar radiation (`surface_solar_radiation_downwards`).
+(`10m_u_component_of_wind`, `10m_v_component_of_wind`), and surface downward
+solar radiation (`surface_solar_radiation_downwards`). The full Di Napoli
+MRT path (`compute_in_script_full`) additionally requires the full ERA5
+single-levels radiation fields (`ssr`, `str`, `strd`, `fdir`), which are not
+part of ERA5-Land.
 
-## Option 2a — Download via Copernicus CDS
+# Obtain daily UTCI
 
-```{r cds-download, eval = RUN_CDS_DOWNLOAD}
-configure_cds <- function() {
-  load_if_needed("ecmwfr")
-  key <- Sys.getenv("CDS_API_KEY", unset = "")
-  if (nzchar(key)) {
-    ecmwfr::wf_set_key(key = key)
+The exposure source is the ECMWF pre-computed daily UTCI product — the same
+product used in Chapter 2, read here at daily resolution. Each file is one
+NetCDF per day (`ECMWF_utci_daily_stats_YYYYMMDD_v1.1_con*.nc`) containing
+the layers `utci_daily_min` and `utci_daily_max`. Mean radiant temperature
+is computed by ECMWF from the full ERA5 radiation fields, so the inflation
+seen in an earlier in-script attempt — which approximated MRT from ERA5-Land
+downward shortwave alone and produced daily-maximum UTCI near 35 °C in every
+season — does not arise here. The grid is the ERA5 0.25° grid (about 28 km);
+because the Kassena-Nankana catchment spans only a few grid cells, within-
+catchment spatial variation in exposure is modest, a point acknowledged in
+the chapter (§3.8.2, §3.10.3).
+
+The exposure is the **daily maximum UTCI**, consistent with an acute-heat-
+stress framing: the percentile thresholds and heatwave-run metrics below are
+all defined on the same daily-maximum distribution, so the exposure
+apparatus is internally coherent. The daily minimum is read only to allow
+percentile diagnostics; no daily-mean exposure is constructed, and the
+midrange of min and max is deliberately not used as a stand-in for the mean
+(it is not the true 24-hour mean and its bias varies by season). The reader
+extracts at the exact household coordinate — no displacement buffer is
+applied, because the Navrongo geocodes are true household locations rather
+than the jittered DHS cluster points used in Chapter 2.
+
+For completeness the script retains alternative sources behind the
+`UTCI_SOURCE` flag: a CDS download path for the same product, the full Di
+Napoli (2018) in-script radiation balance (which requires full ERA5 inputs,
+not ERA5-Land), and the deprecated ERA5-Land + simplified-MRT path retained
+only to reproduce the first run.
+
+## Recommended path — local ECMWF daily UTCI files
+
+```{r local-daily, eval = RUN_LOCAL_DAILY}
+# Read the ECMWF daily UTCI files already on disk in UTCI_DIR. For each unique
+# (location, day) pair in the extraction grid, open the matching daily file
+# and extract the daily MAXIMUM UTCI at the household coordinate. Daily max is
+# the sole exposure; no daily-mean construct is built.
+
+# 1. Discover and date-index the daily files.
+daily_files <- list.files(UTCI_DIR, pattern = "\\.nc$", full.names = TRUE)
+if (length(daily_files) == 0) {
+  stop("No .nc files found in UTCI_DIR: ", UTCI_DIR)
+}
+file_index <- tibble(
+  path = daily_files,
+  day  = as.Date(vapply(daily_files, parse_date_from_filename, as.Date(NA)),
+                 origin = "1970-01-01")
+) |>
+  filter(!is.na(day)) |>
+  distinct(day, .keep_all = TRUE)
+
+cat(sprintf("Daily UTCI files discovered: %s (dated %s to %s)\n",
+            format(nrow(file_index), big.mark = ","),
+            format(min(file_index$day)), format(max(file_index$day))))
+
+# 2. Which calendar days are actually needed (from the extraction grid).
+days_needed <- sort(unique(as.Date(extract_grid$day)))
+files_to_read <- file_index |> filter(day %in% days_needed)
+
+missing_days <- setdiff(as.character(days_needed), as.character(files_to_read$day))
+if (length(missing_days) > 0) {
+  warning(sprintf("%d needed days have no daily file (e.g. %s). These become NA.",
+                  length(missing_days), paste(head(missing_days, 3), collapse = ", ")))
+}
+cat(sprintf("Days needed: %s; daily files available for them: %s\n",
+            format(length(days_needed), big.mark = ","),
+            format(nrow(files_to_read), big.mark = ",")))
+
+# 3. Build the location point object once (true household coordinates).
+loc_pts <- terra::vect(as.matrix(locations[, c("lon", "lat")]),
+                       crs = "EPSG:4326")
+
+# 4. Read each needed day once, extract daily-max UTCI at all locations.
+read_one_day <- function(path, d) {
+  # Repair zip-disguised NetCDFs if necessary.
+  if (is_zipfile(path)) {
+    fixed <- fix_zip_nc(path)
+    if (is.na(fixed)) return(NULL)
+    path <- fixed
+  }
+  r <- tryCatch(terra::rast(path), error = function(e) NULL)
+  if (is.null(r)) return(NULL)
+
+  r_max <- get_daily_layer(r, "max")
+  v_max <- terra::extract(r_max, loc_pts)[, 2]
+
+  # ECMWF UTCI ships in kelvin; convert to °C if needed.
+  if (is_kelvin(r_max)) v_max <- v_max - 273.15
+
+  tibble(loc_id = locations$loc_id, day = d, utci = v_max)
+}
+
+start_time <- Sys.time()
+daily_list <- vector("list", nrow(files_to_read))
+for (k in seq_len(nrow(files_to_read))) {
+  daily_list[[k]] <- read_one_day(files_to_read$path[k], files_to_read$day[k])
+  if (k %% 365L == 0L || k == nrow(files_to_read)) {
+    elapsed <- difftime(Sys.time(), start_time, units = "mins")
+    cat(sprintf("  %s / %s days read — %.1f min elapsed\n",
+                format(k, big.mark = ","),
+                format(nrow(files_to_read), big.mark = ","),
+                as.numeric(elapsed)))
   }
 }
 
-if (ERA5_ACQUISITION == "cds_download") {
-  configure_cds()
-}
+daily_utci <- bind_rows(daily_list) |>
+  distinct(loc_id, day, .keep_all = TRUE) |>
+  mutate(day = as.Date(day))
 
-cds_request <- function(year, month) {
+saveRDS(daily_utci, file.path(LOG_DIR, "daily_utci_consolidated.rds"))
+cat(sprintf(
+  "\nDaily UTCI table assembled from local ECMWF files: %s rows (exposure = daily maximum UTCI)\n",
+  format(nrow(daily_utci), big.mark = ",")
+))
+```
+
+## Alternative path — download ECMWF daily UTCI from the CDS
+
+```{r utci-product, eval = RUN_UTCI_PRODUCT}
+# Self-guard for interactive runs (see compute-utci for rationale).
+if (!isTRUE(RUN_UTCI_PRODUCT)) {
+  message("Skipping CDS UTCI-product download/read (UTCI_SOURCE = '",
+          UTCI_SOURCE, "').")
+} else {
+
+# Acquire and read ECMWF's pre-computed daily UTCI from the CDS
+# "derived-utci-historical" dataset. The product provides UTCI at hourly
+# resolution on the ERA5 grid (0.25°); we aggregate to daily max at each
+# household coordinate.
+#
+# The product variable is "universal_thermal_climate_index"; values are in
+# kelvin in the NetCDF and converted to °C here.
+
+utci_product_request <- function(year, month) {
   first_day <- as.Date(sprintf("%04d-%02d-01", year, month))
   n_days    <- lubridate::days_in_month(first_day)
-
   list(
-    dataset_short_name = "reanalysis-era5-land",
-    variable           = c("2m_temperature",
-                           "2m_dewpoint_temperature",
-                           "10m_u_component_of_wind",
-                           "10m_v_component_of_wind",
-                           "surface_solar_radiation_downwards"),
+    dataset_short_name = "derived-utci-historical",
+    variable           = "universal_thermal_climate_index",
+    product_type       = "consolidated_dataset",
+    version            = "1_1",
     year               = sprintf("%04d", year),
     month              = sprintf("%02d", month),
     day                = sprintf("%02d", seq_len(n_days)),
-    time               = sprintf("%02d:00", 0:23),
     area               = c(BBOX$lat_max, BBOX$lon_min,
                            BBOX$lat_min, BBOX$lon_max),
     data_format        = "netcdf",
     download_format    = "unarchived",
-    target             = sprintf("era5_land_navrongo_%04d%02d.nc", year, month)
+    target             = sprintf("utci_navrongo_%04d%02d.nc", year, month)
   )
 }
 
-download_one_month <- function(year, month, path, max_tries = 4) {
-  req <- cds_request(year, month)
+# Which (year, month) tiles are needed, from the extraction grid.
+extract_grid_ym <- extract_grid |>
+  mutate(year = lubridate::year(day), month = lubridate::month(day))
 
-  for (attempt in seq_len(max_tries)) {
-    ok <- tryCatch({
-      ecmwfr::wf_request(
-        request  = req,
-        transfer = TRUE,
-        path     = path,
-        time_out = 3 * 3600,
-        verbose  = FALSE
-      )
-      TRUE
-    }, error = function(e) {
-      msg <- conditionMessage(e)
-      message(sprintf("Failed %04d-%02d on attempt %d/%d: %s",
-                      year, month, attempt, max_tries, msg))
-      FALSE
-    })
+month_index <- extract_grid_ym |>
+  distinct(year, month) |>
+  arrange(year, month) |>
+  mutate(file = sprintf("utci_navrongo_%04d%02d.nc", year, month),
+         path = file.path(UTCI_DIR, file))
 
-    out_file <- file.path(path, sprintf("era5_land_navrongo_%04d%02d.nc", year, month))
-    if (ok && file.exists(out_file)) return(TRUE)
-
-    if (attempt < max_tries) {
-      Sys.sleep(30 * attempt)
+# Download any tiles not already cached (only if acquisition is via CDS).
+if (ERA5_ACQUISITION == "cds_download") {
+  configure_cds()
+  to_get <- month_index |> filter(!file.exists(path))
+  if (nrow(to_get) > 0) {
+    cat(sprintf("Downloading %d UTCI-product tiles from CDS...\n", nrow(to_get)))
+    for (i in seq_len(nrow(to_get))) {
+      req <- utci_product_request(to_get$year[i], to_get$month[i])
+      ecmwfr::wf_request(request = req, transfer = TRUE,
+                         path = UTCI_DIR, time_out = 3 * 3600, verbose = FALSE)
+      if (i %% 12 == 0 || i == nrow(to_get)) {
+        cat(sprintf("  %d / %d tiles downloaded\n", i, nrow(to_get)))
+      }
     }
-  }
-
-  FALSE
-}
-
-month_grid <- expand.grid(year = YEAR_MIN:YEAR_MAX, month = 1:12) |>
-  dplyr::arrange(year, month) |>
-  dplyr::mutate(
-    file = sprintf("era5_land_navrongo_%04d%02d.nc", year, month),
-    path = file.path(CLIMATE_DIR, file)
-  ) |>
-  dplyr::filter(!file.exists(path))
-
-if (nrow(month_grid) == 0) {
-  cat("All required ERA5-Land tiles already cached.\n")
-} else {
-  cat(sprintf("Downloading %d month-tiles from CDS...\n", nrow(month_grid)))
-
-  failed <- vector("list", 0)
-
-  for (i in seq_len(nrow(month_grid))) {
-    yy <- month_grid$year[i]
-    mm <- month_grid$month[i]
-
-    cat(sprintf("[%d/%d] %04d-%02d\n", i, nrow(month_grid), yy, mm))
-
-    success <- download_one_month(yy, mm, CLIMATE_DIR, max_tries = 4)
-
-    if (!success) {
-      failed[[length(failed) + 1]] <- data.frame(year = yy, month = mm)
-    }
-
-    if (i %% 6 == 0 || i == nrow(month_grid)) {
-      cat(sprintf("  completed %d / %d requests\n", i, nrow(month_grid)))
-    }
-  }
-
-  if (length(failed) > 0) {
-    failed_df <- dplyr::bind_rows(failed)
-    readr::write_csv(failed_df, file.path(LOG_DIR, "era5_failed_downloads.csv"))
-    cat(sprintf("Failed months logged to %s\n",
-                file.path(LOG_DIR, "era5_failed_downloads.csv")))
   } else {
-    cat("All requested ERA5-Land tiles downloaded successfully.\n")
+    cat("All required UTCI-product tiles already cached.\n")
   }
 }
+
+# Read each tile, extract hourly UTCI at required household coordinates,
+# aggregate to daily max and mean.
+read_utci_product_tile <- function(nc_path, locations_pts, days_needed) {
+  r <- terra::rast(nc_path)
+  times <- parse_era5_times(r)                # reuse the shared time parser
+  pts <- terra::vect(as.matrix(locations_pts[, c("lon", "lat")]),
+                     crs = "EPSG:4326")
+  vals <- terra::extract(r, pts)[, -1, drop = FALSE]
+  vals <- as.matrix(vals)
+  # Kelvin → °C if needed (UTCI product is distributed in K).
+  if (mean(vals, na.rm = TRUE) > 100) vals <- vals - 273.15
+
+  hour_dates  <- as.Date(times)
+  unique_days <- sort(unique(hour_dates))
+  if (!is.null(days_needed)) {
+    unique_days <- sort(intersect(unique_days, as.Date(days_needed)))
+  }
+
+  map_dfr(unique_days, function(d) {
+    cols <- which(hour_dates == d)
+    if (length(cols) == 0) return(NULL)
+    dmax  <- apply(vals[, cols, drop = FALSE], 1, max,  na.rm = TRUE)
+    dmean <- rowMeans(vals[, cols, drop = FALSE], na.rm = TRUE)
+    dmax[!is.finite(dmax)]   <- NA_real_
+    dmean[!is.finite(dmean)] <- NA_real_
+    tibble(loc_id = locations_pts$loc_id, day = d,
+           utci = dmax, utci_mean = dmean)
+  })
+}
+
+daily_list <- vector("list", nrow(month_index))
+start_time <- Sys.time()
+for (k in seq_len(nrow(month_index))) {
+  yy <- month_index$year[k]; mm <- month_index$month[k]
+  grid_month <- extract_grid_ym |> filter(year == yy, month == mm)
+  locs_month <- locations |> filter(loc_id %in% unique(grid_month$loc_id))
+  days_month <- unique(grid_month$day)
+
+  daily_list[[k]] <- read_utci_product_tile(
+    nc_path = month_index$path[k], locations_pts = locs_month,
+    days_needed = days_month
+  )
+  if (k %% 12L == 0L || k == nrow(month_index)) {
+    elapsed <- difftime(Sys.time(), start_time, units = "mins")
+    cat(sprintf("  Tile %d / %d (%04d-%02d) — %.1f min elapsed\n",
+                k, nrow(month_index), yy, mm, as.numeric(elapsed)))
+  }
+}
+
+daily_utci <- bind_rows(daily_list) |>
+  distinct(loc_id, day, .keep_all = TRUE) |>
+  mutate(day = as.Date(day))
+
+saveRDS(daily_utci, file.path(UTCI_DIR, "daily_utci_consolidated.rds"))
+cat(sprintf(
+  "\nDaily UTCI table written from pre-computed product: %s rows (exposure = daily maximum UTCI)\n",
+  format(nrow(daily_utci), big.mark = ",")
+))
+
+}  # end interactive self-guard for utci-product
 ```
 
-
-# Compute daily UTCI
-
-The Bröde et al. (2012) polynomial approximation gives UTCI as a function
-of air temperature ($T_a$, °C), mean radiant temperature (MRT, °C), wind
-speed at 10 m above ground ($v_a$, m/s), and relative humidity
-($\text{RH}$, %). When `UTCI_SOURCE = "compute_in_script_package"` the
-script uses the `comf` R package (Schweiker 2016), which implements the
-Bröde polynomial as `comf::calcUTCI(ta, tr, vel, rh)`. The fully-manual
-fallback (`UTCI_SOURCE = "compute_in_script_manual"`) sources a
-`utci_brode.R` helper file that contains the same polynomial in
-explicit form.
-
-The mean radiant temperature is approximated following Di Napoli et al.
-(2018) using only ERA5-Land 2 m air temperature and de-accumulated
-downward shortwave radiation, with constants chosen for Sahelian
-land-surface conditions (albedo 0.30, projected-area factor 0.97).
-
-A subtle but consequential implementation detail: ERA5-Land's
-`surface_solar_radiation_downwards` (SSRD) is accumulated in J/m² from
-00:00 UTC to the forecast hour, not instantaneous W/m². To recover
-hourly mean W/m² for the MRT calculation, the script de-accumulates the
-SSRD field via successive differences before the unit conversion. This
-step matters: treating the raw accumulated value as a per-second mean
-would produce MRT estimates that are larger by approximately a factor of
-the hour-of-day, with substantial downstream bias in UTCI.
-
-## Option 1A/1C — Compute from ERA5-Land inputs
+## In-script computation from ERA5-Land inputs (legacy / full-ERA5)
 
 ```{r compute-utci, eval = RUN_UTCI_COMPUTE}
+# Self-guard: the knitr eval= flag skips this chunk during rendering, but it
+# does NOT protect against running the document interactively (line by line in
+# the console), where eval= has no effect. This guard makes the chunk exit
+# cleanly in both cases, so the default local_ecmwf_daily run is never
+# interrupted by the legacy in-script ERA5-Land path.
+if (!isTRUE(RUN_UTCI_COMPUTE)) {
+  message("Skipping in-script ERA5-Land UTCI computation (UTCI_SOURCE = '",
+          UTCI_SOURCE, "').")
+} else {
+
 # For each (year, month) tile needed by extract_grid, read ERA5-Land inputs,
 # compute hourly UTCI only at required household coordinates and calendar
-# days, aggregate to daily max (primary) and daily mean (sensitivity), and
-# write a consolidated table to UTCI_DIR.
+# days, aggregate to daily max and daily mean, and write a consolidated table.
 
 # ----------------------------------------------------------------------------
 # Helper: De-accumulate ERA5-Land hourly accumulated radiation.
@@ -675,18 +982,86 @@ compute_daily_utci <- function(nc_path, locations_pts, days_needed = NULL) {
   rh_pct <- 100 * e_sat(d2m_C) / e_sat(t2m_C)
   rh_pct[rh_pct > 100] <- 100
 
-  sigma  <- 5.67e-8
-  albedo <- 0.30
-  eps_p  <- 0.97
-  mrt_K  <- ((ssrd_Wm2 * (1 - albedo) / (sigma * eps_p)) +
-             (t2m_C + 273.15)^4)^0.25
-  mrt_C  <- mrt_K - 273.15
+  # --------------------------------------------------------------------------
+  # Mean radiant temperature.
+  # --------------------------------------------------------------------------
+  if (UTCI_SOURCE == "compute_in_script_full") {
+    # Full Di Napoli et al. (2018) radiation balance. This REQUIRES the full
+    # ERA5 single-levels radiation fields, which must have been read alongside
+    # the four basic inputs above:
+    #   ssr  — surface net solar radiation (J/m², accumulated)
+    #   str  — surface net thermal radiation (J/m², accumulated)
+    #   strd — surface thermal radiation downwards (J/m², accumulated)
+    #   fdir — total-sky direct solar radiation at surface (J/m², accumulated)
+    # plus the solar zenith angle, computed from latitude/longitude/time.
+    #
+    # MRT is the temperature of a uniform enclosure giving the same radiant
+    # load as the actual environment:
+    #   S_str = MRT_long + (alpha_ir / eps_p) * MRT_short
+    # where the longwave term combines downward and upward longwave, and the
+    # shortwave term combines diffuse, reflected, and (zenith-weighted) direct
+    # beam. fp(zenith) is the projected-area factor for a standing person.
+    needed_full <- c("ssr", "str", "strd", "fdir")
+    have_full   <- exists("rad_full") && all(needed_full %in% names(rad_full))
+    if (!have_full) {
+      stop("UTCI_SOURCE = 'compute_in_script_full' requires the full ERA5 ",
+           "radiation fields (ssr, str, strd, fdir) to be read into `rad_full`. ",
+           "These are NOT available in ERA5-Land. Stage full ERA5 single-levels ",
+           "inputs, or use UTCI_SOURCE = 'cds_utci_product' instead.")
+    }
+
+    sigma  <- 5.67e-8
+    alpha_ir <- 0.70   # shortwave absorption coefficient of the human body
+    eps_p    <- 0.97   # emissivity / projected-area emission factor
+    # De-accumulate the radiation fields to hourly mean W/m².
+    ssr_W  <- deaccumulate_ssrd(rad_full$ssr,  hour_of_day)
+    str_W  <- deaccumulate_ssrd(rad_full$str,  hour_of_day)
+    strd_W <- deaccumulate_ssrd(rad_full$strd, hour_of_day)
+    fdir_W <- deaccumulate_ssrd(rad_full$fdir, hour_of_day)
+
+    # Solar zenith angle (radians) at each (location, time).
+    cossza <- solar_cos_zenith(locations_pts$lat, locations_pts$lon, t2m$times)
+    cossza[cossza < 0] <- 0  # sun below horizon → no direct beam
+
+    # Projected-area factor for a standing/walking person (Di Napoli 2018).
+    fp <- 0.308 * cos((pi/180) * (acos(cossza) * 180/pi) * (0.998 -
+            ((acos(cossza) * 180/pi)^2) / 50000))
+
+    # Diffuse shortwave = downward shortwave − direct beam.
+    # Downward shortwave is recovered as ssr_down = ssr_net / (1 - albedo_sfc);
+    # ERA5 provides net, so use the standard surface albedo for partition.
+    albedo_sfc <- 0.30
+    sw_down    <- ssrd_Wm2                # already the downward shortwave
+    sw_diffuse <- pmax(sw_down - fdir_W, 0)
+    sw_reflect <- albedo_sfc * sw_down
+
+    # Mean radiant flux density (W/m²): hemispheric longwave (down + up) plus
+    # absorbed shortwave (diffuse + reflected isotropic, direct via fp).
+    lw_up   <- strd_W - str_W             # upward longwave = down − net
+    Rlong   <- 0.5 * strd_W + 0.5 * lw_up
+    Rshort  <- (alpha_ir / eps_p) *
+               (0.5 * sw_diffuse + 0.5 * sw_reflect + fp * fdir_W)
+    mrt_K   <- ((Rlong + Rshort) / sigma)^0.25
+    mrt_C   <- mrt_K - 273.15
+
+  } else {
+    # DEPRECATED simplified MRT (UTCI_SOURCE = "compute_in_script_package").
+    # Retained only to reproduce the first run. Known to over-weight daytime
+    # shortwave and inflate daily-maximum UTCI; not for analytic use. See the
+    # narrative above and prefer UTCI_SOURCE = "cds_utci_product".
+    sigma  <- 5.67e-8
+    albedo <- 0.30
+    eps_p  <- 0.97
+    mrt_K  <- ((ssrd_Wm2 * (1 - albedo) / (sigma * eps_p)) +
+               (t2m_C + 273.15)^4)^0.25
+    mrt_C  <- mrt_K - 273.15
+  }
 
   n_loc <- nrow(t2m_C)
   n_t   <- ncol(t2m_C)
   utci_hourly <- matrix(NA_real_, n_loc, n_t)
 
-  if (UTCI_SOURCE == "compute_in_script_package") {
+  if (UTCI_SOURCE %in% c("compute_in_script_full", "compute_in_script_package")) {
     utci_hourly <- matrix(
       calc_utci_vec(
         ta  = as.vector(t2m_C),
@@ -797,9 +1172,11 @@ daily_utci <- bind_rows(daily_utci_list) |>
 
 saveRDS(daily_utci, file.path(UTCI_DIR, "daily_utci_consolidated.rds"))
 cat(sprintf(
-  "\nDaily UTCI table written: %s rows (primary = daily max; utci_mean = daily mean)\n",
+  "\nDaily UTCI table written: %s rows (exposure = daily maximum UTCI)\n",
   format(nrow(daily_utci), big.mark = ",")
 ))
+
+}  # end interactive self-guard for compute-utci
 ```
 
 
@@ -810,26 +1187,23 @@ that the downstream DLNM, case-crossover, and trimester-regression scripts
 consume.
 
 ```{r assemble-exposure}
-# Join daily UTCI values (primary = daily max) to the (pregnancy, day) table.
+# Join daily UTCI values (daily maximum — the sole exposure) to the
+# (pregnancy, day) table.
 preg_daily <- preg_days |>
   mutate(day = as.Date(day)) |>
   left_join(
     daily_utci |>
-      dplyr::select(loc_id, day, utci, utci_mean) |>
+      dplyr::select(loc_id, day, utci) |>
       mutate(day = as.Date(day)),
     by = c("loc_id", "day")
   )
 
 n_total  <- nrow(preg_daily)
 n_filled <- sum(!is.na(preg_daily$utci))
-cat(sprintf("Pregnancy-day cells filled (daily max): %s of %s (%.2f%%)\n",
+cat(sprintf("Pregnancy-day cells filled (daily max UTCI): %s of %s (%.2f%%)\n",
             format(n_filled, big.mark = ","),
             format(n_total,  big.mark = ","),
             100 * n_filled / n_total))
-cat(sprintf("Pregnancy-day cells filled (daily mean sensitivity): %s of %s (%.2f%%)\n",
-            format(sum(!is.na(preg_daily$utci_mean)), big.mark = ","),
-            format(n_total, big.mark = ","),
-            100 * mean(!is.na(preg_daily$utci_mean))))
 
 # Shared helper: window summaries from a chosen daily UTCI column.
 window_summaries <- function(preg_daily_df, utci_col, suffix = "") {
@@ -858,16 +1232,16 @@ window_summaries <- function(preg_daily_df, utci_col, suffix = "") {
     ) |>
     pivot_wider(names_from = trimester, values_from = mean_val, names_prefix = "") |>
     rename(
-      !!paste0("t1_mean_utci", suffix) := t1,
-      !!paste0("t2_mean_utci", suffix) := t2,
-      !!paste0("t3_mean_utci", suffix) := t3
+      !!paste0("t1_meanmax_utci", suffix) := t1,
+      !!paste0("t2_meanmax_utci", suffix) := t2,
+      !!paste0("t3_meanmax_utci", suffix) := t3
     )
 
   preg_mean <- preg_with_dates |>
     filter(day >= preg_start_assumed, day <= child_dob) |>
     group_by(row_id) |>
     summarise(
-      !!paste0("preg_mean_utci", suffix) := if (all(is.na(.data[[utci_col]]))) {
+      !!paste0("preg_meanmax_utci", suffix) := if (all(is.na(.data[[utci_col]]))) {
         NA_real_
       } else {
         mean(.data[[utci_col]], na.rm = TRUE)
@@ -882,7 +1256,7 @@ window_summaries <- function(preg_daily_df, utci_col, suffix = "") {
         filter(lag >= 0L, lag < n) |>
         group_by(row_id) |>
         summarise(
-          !!paste0("last_", n, "d_mean_utci", suffix) := if (all(is.na(.data[[utci_col]]))) {
+          !!paste0("last_", n, "d_meanmax_utci", suffix) := if (all(is.na(.data[[utci_col]]))) {
             NA_real_
           } else {
             mean(.data[[utci_col]], na.rm = TRUE)
@@ -896,8 +1270,9 @@ window_summaries <- function(preg_daily_df, utci_col, suffix = "") {
   list(trimester = trimester, preg_mean = preg_mean, short_windows = short_windows)
 }
 
+# Window summaries are means of the DAILY-MAXIMUM UTCI over each window
+# (i.e. the average peak heat stress across the window), not daily means.
 primary_summaries <- window_summaries(preg_daily, "utci", suffix = "")
-sens_summaries    <- window_summaries(preg_daily, "utci_mean", suffix = "_sens")
 
 trimester_means <- primary_summaries$trimester
 preg_mean       <- primary_summaries$preg_mean
@@ -933,20 +1308,119 @@ exposure <- preg |>
   left_join(trimester_means, by = "row_id") |>
   left_join(preg_mean, by = "row_id") |>
   left_join(short_windows, by = "row_id") |>
-  left_join(sens_summaries$trimester, by = "row_id") |>
-  left_join(sens_summaries$preg_mean, by = "row_id") |>
-  left_join(sens_summaries$short_windows, by = "row_id") |>
   left_join(coverage, by = "row_id")
+```
+
+# Percentile and heatwave exposure metrics
+
+These metrics, carried over from the Chapter 2 daily pipeline, summarise heat
+*intensity* and *persistence* over each pregnancy window, complementing the
+mean-based summaries above and the daily lag matrix. Percentile thresholds
+are **location-specific**: each grid cell's own daily-max UTCI distribution
+over the analytic window defines its p90 and p95. For each pregnancy and each
+window (full pregnancy and the three trimesters) the script computes the
+number of days at or above each threshold, the cumulative degree-days of
+exceedance above the threshold, and the longest consecutive run at or above
+the p90 threshold (a heatwave-duration measure).
+
+```{r heat-metrics}
+# 1. Location-specific percentile thresholds from each cell's daily-max series
+#    over the full analytic window (using the consolidated daily_utci table).
+loc_thresholds <- daily_utci |>
+  group_by(loc_id) |>
+  summarise(
+    thr_p90 = quantile(utci, PERCENTILES[1] / 100, na.rm = TRUE),
+    thr_p95 = quantile(utci, PERCENTILES[2] / 100, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2. Tag each pregnancy-day with its window membership and exceedance flags.
+preg_day_tagged <- preg_daily |>
+  # preg_daily already carries loc_id (from preg_days), so import only the
+  # date columns from preg here — re-importing loc_id would create loc_id.x /
+  # loc_id.y and break the loc_thresholds join below.
+  inner_join(preg |> dplyr::select(row_id, child_dob, preg_start_assumed),
+             by = "row_id") |>
+  left_join(loc_thresholds, by = "loc_id") |>
+  mutate(
+    days_from_conception = as.integer(day - preg_start_assumed),
+    window = case_when(
+      day < preg_start_assumed | day > child_dob ~ NA_character_,
+      days_from_conception <= TRIMESTER1_END                              ~ "t1",
+      days_from_conception <= TRIMESTER2_END                              ~ "t2",
+      TRUE                                                                ~ "t3"
+    ),
+    exc90 = as.integer(!is.na(utci) & utci >= thr_p90),
+    exc95 = as.integer(!is.na(utci) & utci >= thr_p95),
+    cumexc90 = pmax(utci - thr_p90, 0),
+    cumexc95 = pmax(utci - thr_p95, 0)
+  )
+
+# 3. Window-level day-count and cumulative-exceedance metrics.
+window_metrics <- function(df, win_label, suffix) {
+  d <- if (win_label == "preg") {
+    df |> filter(!is.na(window))
+  } else {
+    df |> filter(window == win_label)
+  }
+  d |>
+    group_by(row_id) |>
+    summarise(
+      "{suffix}_p90_days"   := sum(exc90, na.rm = TRUE),
+      "{suffix}_p95_days"   := sum(exc95, na.rm = TRUE),
+      "{suffix}_p90_cumexc" := sum(cumexc90, na.rm = TRUE),
+      "{suffix}_p95_cumexc" := sum(cumexc95, na.rm = TRUE),
+      "{suffix}_ndays"      := sum(!is.na(utci)),
+      .groups = "drop"
+    )
+}
+
+# 4. Longest consecutive run at or above p90 within a window (heatwave length).
+max_run_metric <- function(df, win_label, suffix) {
+  d <- if (win_label == "preg") {
+    df |> filter(!is.na(window))
+  } else {
+    df |> filter(window == win_label)
+  }
+  d |>
+    arrange(row_id, day) |>
+    group_by(row_id) |>
+    summarise(
+      "{suffix}_p90_maxrun" := {
+        x <- exc90[order(day)]
+        x[is.na(x)] <- 0L
+        if (length(x) == 0) 0L else max(rle(x)$lengths[rle(x)$values == 1L], 0L)
+      },
+      .groups = "drop"
+    )
+}
+
+heat_metrics <- preg |> dplyr::select(row_id)
+for (w in c("preg", "t1", "t2", "t3")) {
+  heat_metrics <- heat_metrics |>
+    left_join(window_metrics(preg_day_tagged, w, w), by = "row_id") |>
+    left_join(max_run_metric(preg_day_tagged, w, w), by = "row_id")
+}
+
+# Attach to the main exposure table and record the thresholds used.
+exposure <- exposure |>
+  left_join(heat_metrics, by = "row_id") |>
+  left_join(preg |> dplyr::select(row_id, loc_id), by = "row_id") |>
+  left_join(loc_thresholds, by = "loc_id") |>
+  dplyr::select(-loc_id)
+
+cat(sprintf("Heat metrics computed for %s pregnancies across %s grid cells.\n",
+            format(nrow(exposure), big.mark = ","),
+            format(nrow(loc_thresholds), big.mark = ",")))
 ```
 
 # Diagnostics
 
 ```{r diag-tables}
+# Window summaries are means of the daily-MAXIMUM UTCI over each window.
 exposure_vars <- c(
-  "t1_mean_utci", "t2_mean_utci", "t3_mean_utci", "preg_mean_utci",
-  paste0("last_", OUTCOME_WINDOWS, "d_mean_utci"),
-  "t1_mean_utci_sens", "t2_mean_utci_sens", "t3_mean_utci_sens", "preg_mean_utci_sens",
-  paste0("last_", OUTCOME_WINDOWS, "d_mean_utci_sens")
+  "t1_meanmax_utci", "t2_meanmax_utci", "t3_meanmax_utci", "preg_meanmax_utci",
+  paste0("last_", OUTCOME_WINDOWS, "d_meanmax_utci")
 )
 
 # Coverage summary
@@ -963,7 +1437,7 @@ coverage_summary <- tibble(
 )
 
 nice_table(coverage_summary,
-           caption = "Per-pregnancy exposure summary — coverage and distribution of derived window means")
+           caption = "Per-pregnancy exposure summary — mean of daily-maximum UTCI over each window")
 
 # DLNM lag-matrix coverage
 lag_coverage_summary <- tibble(
@@ -978,6 +1452,24 @@ lag_coverage_summary <- tibble(
 )
 nice_table(lag_coverage_summary,
            caption = "DLNM lag-matrix coverage (lag_0 through lag_30)")
+
+# Heat-metric summary (carried over from Chapter 2)
+heat_summary <- tibble(
+  metric = c("median p90 threshold (°C, across cells)",
+             "median p95 threshold (°C, across cells)",
+             "median pregnancy days ≥ p90",
+             "median pregnancy days ≥ p95",
+             "median longest p90 run in pregnancy (days)",
+             "median T3 days ≥ p90"),
+  value  = c(round(median(exposure$thr_p90, na.rm = TRUE), 1),
+             round(median(exposure$thr_p95, na.rm = TRUE), 1),
+             round(median(exposure$preg_p90_days, na.rm = TRUE), 1),
+             round(median(exposure$preg_p95_days, na.rm = TRUE), 1),
+             round(median(exposure$preg_p90_maxrun, na.rm = TRUE), 1),
+             round(median(exposure$t3_p90_days, na.rm = TRUE), 1))
+)
+nice_table(heat_summary,
+           caption = "Heat-intensity and heatwave metrics (location-specific percentiles)")
 ```
 
 # Persist outputs
