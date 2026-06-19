@@ -158,7 +158,7 @@ attributes, so they remain accessible for documentation while we operate on
 the underlying numeric codes.
 
 ```{r load-raw}
-raw <- read_dta(IN_PATH)
+raw <- read_dta("C:/Users/bedia/Downloads/Chapter 3_Dissertation/vincent_phd_10data_20052026.dta")
 
 tibble(metric = c("rows", "columns",
                   "unique mothers (motherid)",
@@ -464,6 +464,55 @@ spine |>
   )) |>
   dplyr::select(indicator, definition, events) |>
   nice_table(caption = "Mortality event counts, full sample (1995–2020)")
+```
+
+## Birth-outcome (child_birth_type) distribution
+
+The mortality table above counts deaths derived from age at death. This block
+tabulates the recorded birth-outcome code directly, so the stillbirth count
+(`child_birth_type == 4`) and the missing share are both explicit. Sentinel
+values 8 (NaN) and 9 (DK) were recoded to NA upstream, so the NA row captures
+records with a missing or don't-know birth outcome.
+
+```{r birth-type-distribution}
+# Raw code distribution, including NA.
+birth_type_tab <- spine |>
+  count(child_birth_type, name = "n") |>
+  mutate(
+    label = recode(as.character(child_birth_type),
+      "1" = "abortion", "2" = "miscarriage", "3" = "live_birth",
+      "4" = "stillbirth", "5" = "neonatal_death_at_record",
+      "6" = "censored_pregnancy", "7" = "ongoing_pregnancy",
+      .missing = "NA (missing / DK)"),
+    pct = round(100 * n / sum(n), 2)
+  ) |>
+  arrange(child_birth_type) |>
+  dplyr::select(child_birth_type, label, n, pct)
+
+nice_table(birth_type_tab,
+           caption = "Distribution of recorded birth outcome (child_birth_type), full file, including missing.")
+
+# Explicit stillbirth headline.
+n_sb    <- sum(spine$stillbirth == 1, na.rm = TRUE)
+n_total <- nrow(spine)
+n_na    <- sum(is.na(spine$child_birth_type))
+cat(sprintf("Recorded stillbirths (child_birth_type == 4): %s of %s records (%.3f%%)\n",
+            format(n_sb, big.mark = ","), format(n_total, big.mark = ","),
+            100 * n_sb / n_total))
+cat(sprintf("child_birth_type missing (NA after sentinel recode): %s (%.2f%%)\n",
+            format(n_na, big.mark = ","), 100 * n_na / n_total))
+```
+
+The labelled `outcome_class` is derived directly from `child_birth_type`, so
+its distribution should agree with the table above; this cross-check confirms
+the labelling step operated as intended.
+
+```{r outcome-class-distribution}
+spine |>
+  count(outcome_class, name = "n") |>
+  mutate(pct = round(100 * n / sum(n), 2)) |>
+  arrange(desc(n)) |>
+  nice_table(caption = "Distribution of labelled birth outcome (outcome_class), full file.")
 ```
 
 ## ANC-reliable sub-cohort (2013 onward)
