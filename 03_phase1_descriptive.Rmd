@@ -1,0 +1,400 @@
+---
+title: "Phase 1 — Descriptive Demography and Exposure Validation"
+subtitle: "Heat Stress and Perinatal Outcomes in the Navrongo HDSS (Chapter 3)"
+author: "Vincent"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = "#>",
+  fig.width  = 9,
+  fig.height = 5,
+  dpi = 110
+)
+```
+
+# Purpose and scope
+
+This document opens Phase 1 of the analytic plan. Before any descriptive
+demography of the outcomes, it **validates the exposure construction**
+produced by `02_link_era5_utci.Rmd` against three substantive checks that a
+correct daily-maximum UTCI series for the Kassena-Nankana catchment must
+pass:
+
+- **Seasonal pattern** — daily-max UTCI should peak in the hot-dry season
+  (roughly March–May) and trough in the wet monsoon (July–August), with a
+  secondary dip in the dry-cool harmattan. A series that is flat across
+  months is a red flag (it was the signature of the earlier MRT-inflation
+  bug); a series with a clear pre-monsoon hump is the expected Sahelian
+  climatology.
+- **Spatial pattern** — within a catchment this small (a few 0.25° grid
+  cells), between-location variation in the daily-max distribution should be
+  modest. Large spatial scatter would indicate a coordinate or grid-matching
+  problem.
+- **Year-on-year trend** — the annual mean of daily-max UTCI should show a
+  gentle upward drift consistent with the regional warming signal over
+  1995–2020, without implausible jumps that would signal a data-version or
+  unit discontinuity.
+
+These checks belong here, in the descriptive phase, rather than in the
+linkage script, whose job is only to build the exposure matrix. Passing them
+is the precondition for trusting `exposure.rds` as the input to the Phase 3
+DLNM.
+
+The remainder of the document then proceeds to the descriptive demography of
+the analytic cohort (outcome rates, birth weight, and covariate
+distributions). Those sections are scaffolded here and will be completed as
+the outcome-modelling phases come online.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(lubridate)
+  library(readr)
+  library(stringr)
+  library(ggplot2)
+  library(scales)
+  library(knitr)
+  library(kableExtra)
+})
+
+theme_set(theme_minimal(base_size = 12))
+```
+
+```{r config}
+# Paths must match those written by 02_link_era5_utci.Rmd.
+OUT_DIR   <- "."
+LOG_DIR   <- file.path(OUT_DIR, "logs")
+
+EXPOSURE_RDS   <- file.path(OUT_DIR, "exposure.rds")
+DAILY_UTCI_RDS <- file.path(LOG_DIR, "daily_utci_consolidated.rds")
+
+# Northern Ghana season convention (used for labelling the seasonal check).
+SEASON_OF <- function(m) {
+  dplyr::case_when(
+    m %in% c(11, 12, 1, 2) ~ "Dry-cool (harmattan)",
+    m %in% c(3, 4, 5)      ~ "Hot-dry (pre-monsoon)",
+    m %in% c(6, 7, 8, 9, 10) ~ "Wet (monsoon)",
+    TRUE ~ NA_character_
+  )
+}
+
+nice_table <- function(x, caption = NULL, full_width = FALSE) {
+  k <- kable(x, caption = caption, format.args = list(big.mark = ","),
+             booktabs = TRUE)
+  if (knitr::is_html_output()) {
+    kable_styling(k, bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = full_width, position = "left")
+  } else {
+    kable_styling(k, latex_options = c("striped", "hold_position"),
+                  full_width = full_width, position = "left")
+  }
+}
+```
+
+```{r load}
+daily_utci <- readRDS("C:/Users/bedia/Downloads/Chapter 3_Dissertation/logs/daily_utci_consolidated.rds")   # one row per (loc_id, day): utci = daily max
+exposure   <- readRDS("C:/Users/bedia/Downloads/Chapter 3_Dissertation/exposure.rds")     # one row per pregnancy
+
+daily_utci <- daily_utci |>
+  mutate(day   = as.Date(day),
+         year  = lubridate::year(day),
+         month = lubridate::month(day))
+
+cat(sprintf("Daily UTCI rows: %s across %s locations and %s days (%s to %s)\n",
+            format(nrow(daily_utci), big.mark = ","),
+            format(dplyr::n_distinct(daily_utci$loc_id), big.mark = ","),
+            format(dplyr::n_distinct(daily_utci$day), big.mark = ","),
+            format(min(daily_utci$day)), format(max(daily_utci$day))))
+cat(sprintf("Pregnancies in exposure file: %s\n",
+            format(nrow(exposure), big.mark = ",")))
+```
+
+# Exposure validation
+
+## Check 1 — Seasonal pattern
+
+A correct daily-maximum UTCI series for the catchment must show the Sahelian
+seasonal cycle: a pronounced hot-dry peak in March–May, a monsoon trough in
+July–August, and intermediate values in the harmattan. The table reports the
+month-by-month distribution of daily-max UTCI pooled across all locations
+and years; the figure shows the same with an interquartile ribbon.
+
+```{r seasonal-table}
+seasonal <- daily_utci |>
+  group_by(month) |>
+  summarise(
+    median_max = round(median(utci, na.rm = TRUE), 1),
+    p10        = round(quantile(utci, 0.10, na.rm = TRUE), 1),
+    p25        = round(quantile(utci, 0.25, na.rm = TRUE), 1),
+    p75        = round(quantile(utci, 0.75, na.rm = TRUE), 1),
+    p90        = round(quantile(utci, 0.90, na.rm = TRUE), 1),
+    n_days     = dplyr::n(),
+    .groups    = "drop"
+  ) |>
+  mutate(month_lab = month.abb[month],
+         season    = SEASON_OF(month))
+
+nice_table(
+  seasonal |> dplyr::select(month_lab, season, p10, p25, median_max, p75, p90, n_days),
+  caption = "Month-by-month distribution of daily-maximum UTCI (°C), pooled across all catchment locations and years 1995–2020."
+)
+
+# Quantitative pass/fail summary of the seasonal contrast.
+hotdry_peak  <- seasonal |> filter(month %in% 3:5)  |> summarise(m = max(median_max)) |> pull(m)
+monsoon_low  <- seasonal |> filter(month %in% 7:8)  |> summarise(m = min(median_max)) |> pull(m)
+seasonal_amp <- round(hotdry_peak - monsoon_low, 1)
+
+cat(sprintf("\nHot-dry peak (Mar–May) median daily-max UTCI: %.1f °C\n", hotdry_peak))
+cat(sprintf("Monsoon trough (Jul–Aug) median daily-max UTCI: %.1f °C\n", monsoon_low))
+cat(sprintf("Seasonal amplitude (peak − trough): %.1f °C\n", seasonal_amp))
+cat(sprintf("Verdict: %s\n",
+            if (seasonal_amp >= 4 && hotdry_peak > monsoon_low)
+              "PASS — clear hot-dry peak over monsoon trough, as expected."
+            else
+              "CHECK — seasonal amplitude is smaller than expected; inspect the series."))
+```
+
+```{r seasonal-figure}
+monthly_dist <- daily_utci |>
+  group_by(month) |>
+  summarise(
+    med = median(utci, na.rm = TRUE),
+    lo  = quantile(utci, 0.25, na.rm = TRUE),
+    hi  = quantile(utci, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(monthly_dist, aes(x = factor(month, levels = 1:12, labels = month.abb))) +
+  geom_ribbon(aes(ymin = lo, ymax = hi, group = 1), alpha = 0.20, fill = "#C0392B") +
+  geom_line(aes(y = med, group = 1), linewidth = 1, colour = "#C0392B") +
+  geom_point(aes(y = med), size = 2, colour = "#C0392B") +
+  labs(
+    title = "Seasonal cycle of daily-maximum UTCI, Navrongo catchment",
+    subtitle = "Median (line) with interquartile ribbon, pooled across locations and 1995–2020",
+    x = NULL, y = "Daily-maximum UTCI (°C)"
+  )
+```
+
+The series should rise to a March–May peak and fall to a July–August trough.
+A near-flat line across the year would indicate a problem with the exposure
+construction; a clear pre-monsoon hump confirms the Sahelian climatology.
+
+## Check 2 — Spatial pattern
+
+Within a catchment of a few grid cells, the daily-max UTCI distribution
+should be nearly identical across locations. This check summarises each
+location's long-run daily-max distribution and reports the spread *between*
+locations. Modest between-location variation is the expected and correct
+result; large scatter would indicate a coordinate or grid-matching fault.
+
+```{r spatial}
+loc_dist <- daily_utci |>
+  group_by(loc_id) |>
+  summarise(
+    loc_median = median(utci, na.rm = TRUE),
+    loc_p90    = quantile(utci, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+spatial_summary <- tibble(
+  metric = c("locations",
+             "between-location SD of the location-median (°C)",
+             "range of location-medians (°C)",
+             "between-location SD of the location-p90 (°C)",
+             "range of location-p90 (°C)"),
+  value = c(
+    nrow(loc_dist),
+    round(sd(loc_dist$loc_median, na.rm = TRUE), 3),
+    round(diff(range(loc_dist$loc_median, na.rm = TRUE)), 2),
+    round(sd(loc_dist$loc_p90, na.rm = TRUE), 3),
+    round(diff(range(loc_dist$loc_p90, na.rm = TRUE)), 2)
+  )
+)
+nice_table(spatial_summary,
+           caption = "Between-location spread in the daily-max UTCI distribution. Small values are expected and correct for a single small catchment.")
+
+spatial_sd <- sd(loc_dist$loc_median, na.rm = TRUE)
+cat(sprintf("\nVerdict: %s\n",
+            if (is.na(spatial_sd) || spatial_sd <= 1.0)
+              "PASS — between-location variation is modest, as expected for a small catchment."
+            else
+              "CHECK — between-location variation is larger than expected; inspect coordinates and grid matching."))
+```
+
+```{r spatial-figure}
+# Map each location's long-run median daily-max UTCI. With all locations in a
+# few grid cells, the map should look near-uniform in colour.
+# Recover loc-level coordinates by reproducing the EXACT loc_id ordering used
+# in 02_link_era5_utci.Rmd: distinct(lon, lat) |> arrange(lat, lon) |> row_number().
+# (daily_utci carries loc_id, not coordinates; exposure carries coordinates.)
+loc_xy <- exposure |>
+  dplyr::select(lon, lat) |>
+  distinct() |>
+  arrange(lat, lon) |>
+  mutate(loc_id = row_number())
+
+loc_map <- loc_xy |> left_join(loc_dist, by = "loc_id")
+
+ggplot(loc_map, aes(x = lon, y = lat, colour = loc_median)) +
+  geom_point(size = 2.4) +
+  scale_colour_viridis_c(option = "C", name = "Median\ndaily-max\nUTCI (°C)") +
+  coord_quickmap() +
+  labs(
+    title = "Spatial distribution of long-run median daily-max UTCI",
+    subtitle = "Household coordinates across the Kassena-Nankana catchment",
+    x = "Longitude", y = "Latitude"
+  )
+```
+
+The map should be close to uniform in colour, reflecting the limited
+within-catchment spatial variation at the 0.25° resolution of the ECMWF
+product. This is the empirical basis for the chapter's statement that
+between-household exposure contrast is small and the temporal (daily, lagged)
+contrast is the dimension the DLNM exploits.
+
+## Check 3 — Year-on-year trend
+
+The annual mean of daily-max UTCI should drift gently upward over 1995–2020,
+consistent with the regional warming signal, without abrupt steps that would
+signal a data-version or unit discontinuity.
+
+```{r trend-table}
+annual <- daily_utci |>
+  filter(year >= 1995, year <= 2020) |>
+  group_by(year) |>
+  summarise(
+    mean_max   = round(mean(utci, na.rm = TRUE), 2),
+    median_max = round(median(utci, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+# Simple linear trend in annual mean daily-max UTCI (°C per decade).
+fit <- lm(mean_max ~ year, data = annual)
+slope_per_decade <- round(unname(coef(fit)["year"]) * 10, 2)
+
+nice_table(annual,
+           caption = "Annual mean and median of daily-maximum UTCI (°C), 1995–2020.")
+
+cat(sprintf("\nLinear trend in annual mean daily-max UTCI: %+0.2f °C per decade\n",
+            slope_per_decade))
+cat(sprintf("Verdict: %s\n",
+            if (!is.na(slope_per_decade) && slope_per_decade >= -0.5 && slope_per_decade <= 1.5)
+              "PASS — gentle warming-consistent drift with no implausible jump."
+            else
+              "CHECK — annual trend is outside the expected gentle-warming range; inspect for a data-version discontinuity."))
+```
+
+```{r trend-figure}
+ggplot(annual, aes(x = year, y = mean_max)) +
+  geom_line(linewidth = 0.8, colour = "#2C3E50") +
+  geom_point(size = 1.8, colour = "#2C3E50") +
+  geom_smooth(method = "lm", se = TRUE, colour = "#C0392B",
+              fill = "#C0392B", alpha = 0.12, linewidth = 0.8) +
+  scale_x_continuous(breaks = seq(1995, 2020, 5)) +
+  labs(
+    title = "Year-on-year trend in annual-mean daily-maximum UTCI",
+    subtitle = "Navrongo catchment, 1995–2020, with linear fit",
+    x = NULL, y = "Annual-mean daily-maximum UTCI (°C)"
+  )
+```
+
+A gentle positive slope is the expected signature of regional warming over
+the period; a flat or mildly positive trend is consistent and acceptable.
+What would warrant investigation is a sharp step between adjacent years,
+which would suggest a change in the underlying data product rather than a
+climatic signal.
+
+## Validation summary
+
+```{r validation-summary}
+validation <- tibble(
+  check = c("Seasonal pattern (hot-dry peak vs monsoon trough)",
+            "Spatial pattern (between-location SD of median)",
+            "Year-on-year trend (°C per decade)"),
+  result = c(sprintf("amplitude %.1f °C", seasonal_amp),
+             sprintf("%.3f °C", spatial_sd),
+             sprintf("%+0.2f °C/decade", slope_per_decade)),
+  verdict = c(
+    if (seasonal_amp >= 4) "PASS" else "CHECK",
+    if (!is.na(spatial_sd) && spatial_sd <= 1.0) "PASS" else "CHECK",
+    if (!is.na(slope_per_decade) && slope_per_decade >= -0.5 &&
+        slope_per_decade <= 1.5) "PASS" else "CHECK"
+  )
+)
+nice_table(validation,
+           caption = "Exposure-validation summary. All three checks should read PASS before the exposure feeds the Phase 3 DLNM.")
+```
+
+If all three checks read PASS, the daily-maximum UTCI exposure is
+climatologically sound and `exposure.rds` is a trustworthy input to the
+Phase 3 distributed-lag model. If any reads CHECK, the corresponding section
+above should be inspected before proceeding.
+
+# Descriptive demography of the analytic cohort
+
+The sections below scaffold the Phase 1 descriptive demography. They are
+intentionally outlined rather than completed here, because the outcome
+tabulations depend on the spine's outcome and covariate fields, which are
+analysed alongside the outcome-modelling phases. The exposure-validation
+section above is the part of Phase 1 that is complete and load-bearing for
+the modelling that follows.
+
+## Cohort overview
+
+```{r cohort-overview}
+# Birth-year span and counts available from the exposure file (geocoded subset).
+cohort <- exposure |>
+  mutate(birth_year = lubridate::year(as.Date(child_dob)))
+
+overview <- tibble(
+  metric = c("pregnancies (geocoded, in window)",
+             "unique mothers",
+             "unique compounds (locationid)",
+             "birth-year range"),
+  value = c(
+    format(nrow(cohort), big.mark = ","),
+    format(dplyr::n_distinct(cohort$motherid), big.mark = ","),
+    format(dplyr::n_distinct(cohort$locationid), big.mark = ","),
+    sprintf("%d–%d", min(cohort$birth_year, na.rm = TRUE),
+            max(cohort$birth_year, na.rm = TRUE))
+  )
+)
+nice_table(overview, caption = "Analytic cohort overview (geocoded subset entering exposure linkage).")
+```
+
+## Outcome rates (to be completed with the full spine)
+
+```{r outcome-rates-placeholder, eval = FALSE}
+# Placeholder. When this script is run against the full spine (not only the
+# exposure file), compute annual and five-year-period rates of stillbirth,
+# day-0, early-neonatal, neonatal, post-neonatal, infant, and under-five
+# mortality, disaggregated by maternal education, SES quintile, residence,
+# season of birth, and calendar period. These map to Objective 1 (§3.10.1).
+```
+
+## Birth-weight distribution (to be completed with the full spine)
+
+```{r birthweight-placeholder, eval = FALSE}
+# Placeholder. Summarise the birth-weight distribution and LBW prevalence for
+# records with valid weights, disaggregated as above. Stream B (§3.10.5).
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
