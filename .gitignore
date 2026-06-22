@@ -1,0 +1,12 @@
+# R output and logs
+*.html
+*.pdf
+*.log
+
+# R data objects
+*.rds
+
+# Large derived CSVs (keep minimal analytic datasets if needed)
+exposure_summaries.csv
+spine.csv
+residency_episodes.csv
