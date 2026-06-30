@@ -295,36 +295,99 @@ outcome_priority <- function(x) {
   )
 }
 
+# ---------------------------------------------------------------------------
+# Pregnancy-level identifier.
+#
+# child_id is populated only for LIVE births, so deduplicating on child_id
+# silently collapses every non-live outcome (stillbirth, miscarriage,
+# abortion), whose child_id is NA, into a single row — which is why a direct
+# child_id-based spine under-counts stillbirths. For a perinatal / pregnancy-
+# outcome analysis the unit of analysis must be the PREGNANCY, not the live
+# child.
+#
+# Every row carries child_dob, the delivery date, which is present for non-
+# live outcomes as well (the date the pregnancy ended in delivery). A
+# pregnancy is therefore identified by the mother and the delivery date:
+# distinct (motherid, child_dob) pairs are distinct pregnancies, capturing
+# stillbirths and other non-live outcomes that child_id excludes. Multiple
+# births (twins) share (motherid, child_dob) and collapse to one pregnancy,
+# which is correct at the pregnancy level; the outcome-priority ordering
+# below ensures the most severe / most complete outcome row represents such
+# a pregnancy.
+# ---------------------------------------------------------------------------
+df <- df |>
+  mutate(
+    preg_id = if_else(
+      !is.na(motherid) & !is.na(child_dob),
+      paste0("P_", as.integer(factor(paste(motherid, as.integer(child_dob),
+                                           sep = "_")))),
+      NA_character_
+    )
+  )
+
 spine_pre <- df |>
   mutate(.outcome_priority = outcome_priority(child_birth_type),
          .miss_score       = rowSums(is.na(across(all_of(analytic_vars))))) |>
-  arrange(child_id, .outcome_priority, .miss_score, desc(sdate)) |>
-  distinct(child_id, .keep_all = TRUE) |>
+  # Within each pregnancy, order so the definite/most-complete outcome row
+  # is kept (e.g. a recorded stillbirth or live birth over a censored row),
+  # mirroring the previous child-level priority but at the pregnancy level.
+  arrange(preg_id, .outcome_priority, .miss_score, desc(sdate)) |>
+  distinct(preg_id, .keep_all = TRUE) |>
   dplyr::select(-.outcome_priority, -.miss_score)
 
-stopifnot(!anyDuplicated(spine_pre$child_id))
+# Rows with no pregnancy key (motherid or child_dob missing) cannot be placed
+# on the pregnancy timeline; quantify them rather than dropping silently.
+n_no_pregkey <- sum(is.na(spine_pre$preg_id))
 
-tibble(metric = c("rows in spine (= unique children)",
+stopifnot(!anyDuplicated(spine_pre$preg_id[!is.na(spine_pre$preg_id)]))
+
+tibble(metric = c("rows in spine (= unique pregnancies)",
+                  "distinct mothers",
+                  "live-birth pregnancies (child_birth_type == 3)",
+                  "non-live outcomes (stillbirth/miscarriage/abortion/ND)",
+                  "  of which recorded stillbirths (type 4)",
+                  "pregnancies with a populated child_id",
                   "rows in raw extract",
-                  "rows removed by deduplication"),
+                  "rows removed by deduplication",
+                  "rows with no pregnancy key (motherid/child_dob NA)"),
        value  = c(nrow(spine_pre),
+                  dplyr::n_distinct(spine_pre$motherid),
+                  sum(spine_pre$child_birth_type == 3, na.rm = TRUE),
+                  sum(spine_pre$child_birth_type %in% c(1, 2, 4, 5), na.rm = TRUE),
+                  sum(spine_pre$child_birth_type == 4, na.rm = TRUE),
+                  sum(!is.na(spine_pre$child_id)),
                   nrow(df),
-                  nrow(df) - nrow(spine_pre))) |>
-  nice_table(caption = "Effect of child-level deduplication")
+                  nrow(df) - nrow(spine_pre),
+                  n_no_pregkey)) |>
+  nice_table(caption = "Effect of pregnancy-level deduplication (one row per mother × delivery date)")
 ```
 
+**Why pregnancy-level, not child-level.** The previous spine deduplicated on
+`child_id`. In this extract `child_id` is populated for non-live outcomes as
+well as live births, so the loss of stillbirths under the old approach arose
+not from missing identifiers but from the deduplication grouping: keying and
+tie-breaking on `child_id` could discard the stillbirth row of a pregnancy in
+favour of another row sharing that identifier. Keying instead on the
+pregnancy (`motherid` × `child_dob`) groups rows by the actual pregnancy
+event, so each recorded outcome—live birth, stillbirth, miscarriage, or
+neonatal death—is preserved as its own pregnancy row. The non-live-outcome
+counts above are the records the Stream A perinatal/early-neonatal analysis
+depends on, and they are now retained in full (compare the birth-outcome
+distribution table below).
+
 **Interpreting the dedup count.** The rows removed by deduplication are not
-"lost" data: they are redundant *maternal-context copies* of children who
+"lost" data: they are redundant *maternal-context copies* of pregnancies that
 appear on more than one residency row in the raw extract. Because the HDSS
 data model is mother-centric (each row is a maternal residency episode,
-not a child), a single child travels alongside the mother across each of
-her recorded residency episodes, producing one row per (child, maternal
-residency) pair. The dedup collapses these to one row per child for
+not a pregnancy), a single pregnancy travels alongside the mother across each of
+her recorded residency episodes, producing one row per (pregnancy, maternal
+residency) pair. The dedup collapses these to one row per pregnancy for
 modelling purposes, while the full residency-episode history is preserved
 separately in `residency_episodes.rds` and can be joined back to the spine
 on `motherid` for analyses that require maternal-migration context. No
-child is dropped: the post-dedup row count equals the number of distinct
-`child_id` values in the raw extract.
+pregnancy is dropped: the post-dedup row count equals the number of distinct
+(`motherid`, `child_dob`) pregnancies in the raw extract, live and non-live
+alike.
 
 **A note on temporal snapshots in the spine.** Because the dedup tie-break
 selects the most recent `sdate` among rows tied on outcome priority and
@@ -659,7 +722,8 @@ saved to `spine_codebook.csv` for reference.
 ```{r codebook}
 spine_codebook <- tribble(
   ~variable,             ~description,
-  "child_id",            "Unique child identifier (NHRC).",
+  "child_id",            "Child/record identifier (NHRC); populated for live and non-live outcomes in this extract. Not a reliable pregnancy key on its own — see preg_id.",
+  "preg_id",             "Pregnancy identifier = mother x delivery date (motherid x child_dob). Unit of analysis for Stream A; one row per pregnancy across live and non-live outcomes.",
   "motherid",            "Unique mother identifier.",
   "locationid",          "Compound identifier.",
   "gps_latitude",        "Household-level GPS latitude (decimal degrees).",

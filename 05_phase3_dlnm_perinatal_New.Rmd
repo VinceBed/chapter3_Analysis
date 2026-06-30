@@ -47,13 +47,17 @@ cross-basis with knots placed from the observed exposure distribution; fit
 the Bayesian hierarchical model in `brms`/Stan; extract and plot the
 exposure–lag–response surface; and identify the critical lag windows.
 
-**Dependency note.** The Stream A primary outcome includes recorded
-stillbirths (`child_birth_type == 4`). The recorded stillbirth count was
-still being confirmed with the NHRC data-management team at the time of
-writing; the script therefore reports the composite count it actually
-constructs from the supplied extract and is robust to the stillbirth set
-being sparse or substantial. If the stillbirth coding is revised, only the
-outcome-construction chunk needs to be re-run.
+**Outcome and identifier note.** The Stream A primary outcome is the
+perinatal composite: recorded stillbirth (`child_birth_type == 4`) or
+early-neonatal death (0–7 days). Recorded stillbirths were initially
+suppressed by a child-level deduplication in an earlier spine build; the
+spine is now deduplicated at the pregnancy level (`preg_id` = mother ×
+delivery date), which recovers them (about 1.5% of recorded outcomes in the
+development sample, stillbirths in fact outnumbering early-neonatal deaths).
+Accordingly, this script joins the exposure matrix to the spine on `preg_id`
+— the guaranteed-unique pregnancy key — rather than on `child_id`, so that
+stillbirths and other non-live outcomes are carried into the analysis rather
+than dropped or collided at the join.
 
 ```{r libraries}
 suppressPackageStartupMessages({
@@ -127,26 +131,31 @@ nice_table <- function(x, caption = NULL, full_width = FALSE) {
 # Assemble the analytic frame
 
 The exposure file carries the daily-max UTCI lag matrix and identifiers; the
-spine carries the outcome and covariates. They are joined on `child_id`.
+spine carries the outcome and covariates. They are joined on `preg_id`, the
+pregnancy-level key (mother × delivery date), so that stillbirths and other
+non-live outcomes are retained rather than dropped.
 
 ```{r load-join}
-exposure <- readRDS(EXPOSURE_RDS)
-spine    <- readRDS(SPINE_RDS)
+# Load the exposure lag matrix and spine from RDS.
+exposure <- readRDS("C:/Users/bedia/Downloads/Chapter 3_Dissertation/exposure.rds")
+spine    <- readRDS("C:/Users/bedia/Downloads/Chapter 3_Dissertation/spine.rds")
+
+stopifnot(is.data.frame(spine))
+# If exposure is a matrix or data.frame, this will be TRUE; otherwise adjust:
+stopifnot(is.matrix(exposure) || is.data.frame(exposure))
 
 # Outcome and covariate fields needed from the spine for Stream A.
 spine_vars <- spine |>
   dplyr::mutate(
     child_birth_type_f = haven::as_factor(child_birth_type),
-    # Infant sex is named `gender` in the raw extract; some spine versions
-    # carry it as `child_gender`. Accept whichever is present so the script
-    # runs unchanged on the development sample and the full NHRC extract.
-    child_gender = haven::as_factor(
-      if ("child_gender" %in% names(spine)) child_gender else gender
-    )
+    # Spine already has child_gender in your str(spine) output.
+    child_gender = haven::as_factor(child_gender)
   ) |>
   dplyr::transmute(
+    preg_id,
     child_id,
-    motherid, locationid,
+    motherid,
+    locationid,
     child_birth_type_f,
     died_enn,
     stillbirth = dplyr::if_else(
@@ -162,31 +171,35 @@ spine_vars <- spine |>
     educ_any_secondary,
     ses_index,
     nulliparous_proxy,
-    child_gender,   # robust to `gender`/`child_gender` (coalesced above)
+    child_gender,
     season3,
     birth_year,
     anc_reliable
   )
 
 frame <- exposure |>
-  inner_join(spine_vars, by = "child_id")
+  inner_join(spine_vars, by = "preg_id")
 
-cat(sprintf("Exposure rows: %s | spine rows: %s | joined: %s\n",
-            format(nrow(exposure), big.mark = ","),
-            format(nrow(spine),    big.mark = ","),
-            format(nrow(frame),    big.mark = ",")))
+cat(sprintf(
+  "Exposure rows: %s | spine rows: %s | joined: %s\n",
+  format(nrow(exposure), big.mark = ","),
+  format(nrow(spine),    big.mark = ","),
+  format(nrow(frame),    big.mark = ",")
+))
 ```
+
 
 ```{r outcome-counts}
 lag_cols <- paste0("lag_", LAG_MIN:LAG_MAX)
 
 frame <- exposure |>
-  inner_join(spine_vars, by = "child_id") |>
+  inner_join(spine_vars, by = "preg_id") |>
   dplyr::rename(
     motherid = motherid.y,
-    locationid = locationid.y
+    locationid = locationid.y,
+    child_id = child_id.y
   ) |>
-  dplyr::select(-motherid.x, -locationid.x) |>
+  dplyr::select(-motherid.x, -locationid.x, -child_id.x) |>
   mutate(lag_complete = rowSums(is.na(across(all_of(lag_cols)))) == 0)
 
 complete <- frame |>
@@ -196,7 +209,7 @@ complete <- frame |>
          !is.na(child_gender), !is.na(season3), !is.na(birth_year),
          !is.na(perinatal)) |>
   dplyr::select(
-    child_id, motherid, locationid, perinatal, stillbirth, died_enn,
+    preg_id, child_id, motherid, locationid, perinatal, stillbirth, died_enn,
     mat_age_yrs, educ_any_secondary, ses_index, nulliparous_proxy,
     child_gender, season3, birth_year,
     all_of(lag_cols)

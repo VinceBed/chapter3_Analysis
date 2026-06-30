@@ -82,14 +82,14 @@ script is written to support each option without restructuring.
 # ============================================================================
 # Paths
 # ============================================================================
-IN_PATH      <- "spine.rds"                # output of 01_build_spine.Rmd
+IN_PATH      <- "C:/Users/bedia/Downloads/Chapter 3_Dissertation/spine.rds"           
 OUT_DIR      <- "."                         # where exposure.rds is written
 
 # Directory holding the downloaded ECMWF daily UTCI files, one NetCDF per day,
 # named ECMWF_utci_daily_stats_YYYYMMDD_v1.1_con*.nc, each with the layers
 # utci_daily_min and utci_daily_max. This is the same product used in
 # Chapter 2, read here at daily resolution for the DLNM lag matrix.
-UTCI_DIR     <- "C:/Users/bedia/Downloads/Chapter 3_Dissertation"
+UTCI_DIR     <- "C:/Users/bedia/Downloads/Chapter 3_Dissertation/Data"
 
 CLIMATE_DIR  <- "era5_land_navrongo"        # cache for the in-script ERA5 path (legacy)
 LOG_DIR      <- file.path(OUT_DIR, "logs")  # extraction diagnostics
@@ -441,7 +441,7 @@ nice_table(gps_summary, caption = "GPS coverage diagnostics")
 preg <- spine |>
   filter(coord_valid,
          birth_year >= YEAR_MIN, birth_year <= YEAR_MAX) |>
-  dplyr::select(child_id, motherid, locationid,
+  dplyr::select(preg_id, child_id, motherid, locationid,
                 gps_longitude, gps_latitude,
                 child_dob, preg_start_assumed,
                 preg_t3_start, preg_last30, preg_last7) |>
@@ -1302,7 +1302,7 @@ coverage <- lag_matrix |>
   dplyr::select(row_id, lag_cells_filled, lag_coverage_pct)
 
 exposure <- preg |>
-  dplyr::select(row_id, child_id, motherid, locationid, lon, lat,
+  dplyr::select(row_id, preg_id, child_id, motherid, locationid, lon, lat,
                 child_dob, preg_start_assumed) |>
   left_join(lag_matrix, by = "row_id") |>
   left_join(trimester_means, by = "row_id") |>
